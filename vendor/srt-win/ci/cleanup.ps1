@@ -22,8 +22,8 @@ if (-not (Test-Path $Exe)) {
 }
 
 if ($env:SRT_ALT_GUID) {
-  & $Exe wfp uninstall --all --sublayer-guid $env:SRT_ALT_GUID
+  & $Exe wfp uninstall --sublayer-guid $env:SRT_ALT_GUID
 }
-& $Exe wfp uninstall --all
+& $Exe wfp uninstall
 & $Exe group delete --name $GroupName
 exit 0

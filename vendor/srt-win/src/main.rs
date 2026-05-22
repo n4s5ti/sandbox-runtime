@@ -78,40 +78,26 @@ enum GroupCmd {
 
 #[derive(Subcommand)]
 enum WfpCmd {
-    /// Install (or refresh) the persistent WFP filters for one user.
-    /// Idempotent. Requires elevation.
+    /// Install (or refresh) the machine-wide persistent WFP filters
+    /// keyed on the group SID. Idempotent. Requires elevation.
     Install {
         #[command(flatten)]
         group: GroupRef,
-        /// User SID to fence (default: current user). Pass explicitly
-        /// when running from a SYSTEM-context deployment script.
-        #[arg(long)]
-        user_sid: Option<String>,
         /// Sublayer GUID. Default is the compile-time constant; pass
         /// when integrating with externally-managed WFP state.
         #[arg(long)]
         sublayer_guid: Option<String>,
     },
-    /// Print WFP fence state for one user as JSON:
-    /// `{state, filters}`. Filters are identified by their
-    /// `providerData` tag, so only `--user-sid` and
-    /// `--sublayer-guid` are relevant — group resolution is not
-    /// needed.
+    /// Print WFP fence state as JSON: `{state, filters}`. Filters
+    /// are identified by their `providerData` tag, so only
+    /// `--sublayer-guid` is relevant.
     Status {
-        #[arg(long)]
-        user_sid: Option<String>,
         #[arg(long)]
         sublayer_guid: Option<String>,
     },
-    /// Remove the WFP filters for one user (or all srt-win filters
-    /// with `--all`). Requires elevation.
+    /// Remove every srt-win-tagged WFP filter under the sublayer.
+    /// Requires elevation.
     Uninstall {
-        #[arg(long)]
-        user_sid: Option<String>,
-        /// Remove every srt-win filter under the sublayer regardless
-        /// of user.
-        #[arg(long)]
-        all: bool,
         #[arg(long)]
         sublayer_guid: Option<String>,
     },
@@ -149,15 +135,6 @@ fn run() -> anyhow::Result<()> {
         sid::lookup_account_sid(&g.name)
             .with_context(|| format!("resolve group '{}'", g.name))
     };
-    let resolve_user_sid = |u: &Option<String>| -> anyhow::Result<String> {
-        match u {
-            Some(s) => {
-                validate_sid("user-sid", s)?;
-                Ok(s.clone())
-            }
-            None => sid::current_user_sid().context("resolve current user"),
-        }
-    };
     let resolve_sublayer = |s: &Option<String>| -> anyhow::Result<windows::core::GUID> {
         match s {
             Some(g) => wfp::parse_guid(g),
@@ -175,7 +152,14 @@ fn run() -> anyhow::Result<()> {
                      referencing an existing group"
                 ));
             }
-            let user = resolve_user_sid(&user_sid)?;
+            let user = match &user_sid {
+                Some(s) => {
+                    validate_sid("user-sid", s)?;
+                    s.clone()
+                }
+                None => sid::current_user_sid()
+                    .context("resolve current user")?,
+            };
             wfp::ensure_group(&group.name, &user)?;
             let gsid = sid::lookup_account_sid(&group.name)?;
             eprintln!(
@@ -257,37 +241,26 @@ fn run() -> anyhow::Result<()> {
 
         // ─── wfp ───────────────────────────────────────────────────
         Cmd::Wfp {
-            sub: WfpCmd::Install { group, user_sid, sublayer_guid },
+            sub: WfpCmd::Install { group, sublayer_guid },
         } => {
             require_elevated()?;
             let gsid = resolve_group_sid(&group)?;
-            let user = resolve_user_sid(&user_sid)?;
             let sl = resolve_sublayer(&sublayer_guid)?;
-            wfp::install_filters(&sl, &gsid, &user)?;
+            wfp::install_filters(&sl, &gsid)?;
             eprintln!(
-                "srt-win: WFP filters installed for user {user} \
-                 (group_sid={gsid}, sublayer={sl:?})"
+                "srt-win: WFP filters installed (group_sid={gsid}, \
+                 sublayer={sl:?})"
             );
         }
-        Cmd::Wfp {
-            sub: WfpCmd::Status { user_sid, sublayer_guid },
-        } => {
-            let user = resolve_user_sid(&user_sid)?;
+        Cmd::Wfp { sub: WfpCmd::Status { sublayer_guid } } => {
             let sl = resolve_sublayer(&sublayer_guid)?;
-            let st = wfp::filter_status(&sl, &user)?;
+            let st = wfp::filter_status(&sl)?;
             println!("{}", serde_json::to_string(&st)?);
         }
-        Cmd::Wfp {
-            sub: WfpCmd::Uninstall { user_sid, all, sublayer_guid },
-        } => {
+        Cmd::Wfp { sub: WfpCmd::Uninstall { sublayer_guid } } => {
             require_elevated()?;
             let sl = resolve_sublayer(&sublayer_guid)?;
-            let target = if all {
-                None
-            } else {
-                Some(resolve_user_sid(&user_sid)?)
-            };
-            let n = wfp::uninstall_filters(&sl, target.as_deref())?;
+            let n = wfp::uninstall_filters(&sl)?;
             eprintln!("srt-win: removed {n} WFP filter(s)");
         }
     }

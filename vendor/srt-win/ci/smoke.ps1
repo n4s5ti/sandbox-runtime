@@ -71,22 +71,34 @@ if ($gsBad.state -ne 'absent') {
   throw "unmapped --group-sid expected absent, got $($gsBad.state)"
 }
 
-# ── negative input: invalid SIDs fail fast with a clear error ───────
-MustFail @('wfp', 'install', '--group-sid', 'not-a-sid')           'invalid --group-sid'
-MustFail @('wfp', 'install', '--name', $GroupName, '--user-sid', 'not-a-sid') 'invalid --user-sid'
+# ── negative input: invalid SID fails fast with a clear error ───────
+MustFail @('wfp', 'install', '--group-sid', 'not-a-sid') 'invalid --group-sid'
 
-# ── wfp: pre-install absent ──────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════
+# WFP lifecycle test — uses $GroupName.
+#
+# The WFP filters are machine-wide and keyed on the group SID. We
+# can install/enumerate/uninstall them regardless of whether the
+# group is on the current token, so $GroupName works fine for the
+# *lifecycle* assertions below. It does NOT work for asserting
+# "the broker gets through" — that needs a group already enabled
+# on this token, which $GroupName isn't (no logout in CI). The
+# fence-behaviour section further down uses BUILTIN\Administrators
+# instead.
+# ═════════════════════════════════════════════════════════════════════
+
+# ── pre-install absent ───────────────────────────────────────────────
 $pre = J @('wfp', 'status')
 if ($pre.state -ne 'absent') {
   throw "pre-install wfp status expected absent, got $($pre.state)"
 }
 
-# First install via --name + explicit --user-sid.
-Run @('wfp', 'install', '--name', $GroupName, '--user-sid', $me)
-$ws = J @('wfp', 'status', '--user-sid', $me)
+# First install via --name.
+Run @('wfp', 'install', '--name', $GroupName)
+$ws = J @('wfp', 'status')
 Write-Host "wfp status: $($ws | ConvertTo-Json -Compress)"
 if ($ws.state -ne 'installed') { throw "expected installed, got $($ws.state)" }
-if ($ws.filters -lt 6)         { throw "expected >=6 filters, got $($ws.filters)" }
+if ($ws.filters -lt 8)         { throw "expected >=8 filters, got $($ws.filters)" }
 
 # Idempotency: second install via --group-sid path leaves the same
 # filter count.
@@ -113,13 +125,13 @@ $stillDefault = J @('wfp', 'status')
 if ($stillDefault.filters -ne $ws.filters) {
   throw "default sublayer perturbed by alt install"
 }
-Run @('wfp', 'uninstall', '--all', '--sublayer-guid', $altGuid)
+Run @('wfp', 'uninstall', '--sublayer-guid', $altGuid)
 $altGone = J @('wfp', 'status', '--sublayer-guid', $altGuid)
 if ($altGone.state -ne 'absent') {
   throw "alt sublayer expected absent after uninstall, got $($altGone.state)"
 }
 
-# ── teardown: per-user uninstall on default sublayer ────────────────
+# ── teardown: uninstall on default sublayer ─────────────────────────
 Run @('wfp', 'uninstall')
 $post = J @('wfp', 'status')
 if ($post.state -ne 'absent') {
@@ -128,6 +140,37 @@ if ($post.state -ne 'absent') {
 # Idempotent no-op: second uninstall must also exit 0.
 Run @('wfp', 'uninstall')
 
+# ═════════════════════════════════════════════════════════════════════
+# WFP fence-behaviour test — uses BUILTIN\Administrators (S-1-5-32-544).
+#
+# Why a different group: the fence relies on AccessCheck against the
+# connecting token, so to assert "broker passes filter 1" we need a
+# group that's *already enabled* on this token. $GroupName was just
+# created and won't be in TokenGroups until a fresh logon. Admins is
+# reliably enabled on the GHA runner.
+# ═════════════════════════════════════════════════════════════════════
+
+$adminsSid = 'S-1-5-32-544'
+Run @('wfp', 'install', '--group-sid', $adminsSid)
+try {
+  # Broker-side: this process has Admins enabled, so filter 1
+  # (PERMIT group-enabled) should let the connect through.
+  $r = curl.exe -s -m 10 -o NUL -w "%{http_code}" https://example.com
+  if ($LASTEXITCODE -ne 0 -or $r -ne '200') {
+    throw "broker egress through filter 1 expected 200, got exit=$LASTEXITCODE code='$r'"
+  }
+  Write-Host "fence: broker egress OK ($r)"
+
+  # Child-side (group deny-only) assertion lands in batch 02 once
+  # `srt-win exec` exists; that batch's smoke-exec.ps1 will run
+  #   srt-win exec --group-sid S-1-5-32-544 -- curl https://example.com
+  # and assert it is BLOCKED.
+}
+finally {
+  Run @('wfp', 'uninstall')
+}
+
+# ── group teardown ───────────────────────────────────────────────────
 Run @('group', 'delete', '--name', $GroupName)
 $gd = J @('group', 'status', '--name', $GroupName)
 if ($gd.state -ne 'absent') {

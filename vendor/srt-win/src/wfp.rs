@@ -4,30 +4,49 @@
 //! ## Design
 //!
 //! At install time we create a local group (default
-//! `sandbox-runtime-net`), add the target user, and persist three WFP
-//! filters per user at each of `FWPM_LAYER_ALE_AUTH_CONNECT_V4` and
-//! `_V6`, all under one persistent sublayer:
+//! `sandbox-runtime-net`), add target users, and persist **one
+//! machine-wide** filter set — four filters at each of
+//! `FWPM_LAYER_ALE_AUTH_CONNECT_V4` and `_V6` (8 total), all under one
+//! persistent sublayer. None of the filters reference a user SID, so
+//! enterprises install once per machine; adding a user to the group
+//! is the only per-user step.
 //!
-//!   1. **PERMIT** (high weight) — `ALE_USER_ID` matches an SD granting
-//!      `<group_sid>`. Any token with the group *enabled* passes here:
-//!      the broker, Explorer, ordinary processes.
-//!   2. **PERMIT** (medium weight) — `ALE_USER_ID` matches an SD
-//!      granting `<user_sid>` AND `IP_REMOTE_ADDRESS` is loopback
-//!      (`127.0.0.0/8` v4, `::1` v6). Lets the sandboxed child reach
-//!      the host-side proxy regardless of which ephemeral port it
-//!      bound.
-//!   3. **BLOCK** (low weight) — `ALE_USER_ID` matches `<user_sid>`.
-//!      Catches the sandboxed child for everything else: its token has
-//!      the group *deny-only*, so filter 1's AccessCheck fails for it.
+//! WFP's `ALE_USER_ID` condition with `FWP_MATCH_EQUAL` evaluates the
+//! supplied security descriptor via `AccessCheck` against the
+//! connecting token: the filter *matches* iff the check grants
+//! access. We use that to discriminate three token states with
+//! respect to `<group_sid>` — **enabled**, **deny-only**, **absent**:
 //!
-//! Filters carry a small JSON tag in `providerData` identifying the
-//! `user_sid` and filter kind, so install/uninstall/status can locate
-//! a specific user's filters by enumeration without relying on fixed
-//! filter GUIDs (which would collide when multiple users on one
-//! machine are fenced under the same sublayer).
+//!   0. **PERMIT non-member** (weight 0xF) — SD
+//!      `O:LSD:(D;;CC;;;<group_sid>)(A;;CC;;;WD)`. The DENY ACE on the
+//!      group hits any token where the group is present (enabled
+//!      *or* deny-only — `SE_GROUP_USE_FOR_DENY_ONLY` SIDs match DENY
+//!      ACEs); only tokens with the group *absent* fall through to
+//!      ALLOW-Everyone and match. Lets services, SYSTEM, and users
+//!      who haven't been added to the group through untouched.
 //!
-//! There is no marker file. `wfp status` enumerates the live engine;
-//! `group status` queries SAM and the current token directly.
+//!   1. **PERMIT group-enabled** (weight 0xE) — SD
+//!      `O:LSD:(A;;CC;;;<group_sid>)`. Matches tokens with the group
+//!      *enabled* (broker, ordinary processes of a member user).
+//!      Tokens with the group deny-only do **not** match: deny-only
+//!      SIDs are ignored by ALLOW ACEs.
+//!
+//!   2. **PERMIT loopback** (weight 0xD) — `IP_REMOTE_ADDRESS` is
+//!      `127.0.0.0/8` (v4) / `::1` (v6). No user condition: anything
+//!      that fell through filters 0 and 1 (i.e. the deny-only
+//!      sandboxed child) can still reach the host proxy.
+//!
+//!   3. **BLOCK** (weight 0x1) — SD `O:LSD:(A;;CC;;;WD)`
+//!      (ALLOW-Everyone). Matches every token; catches the sandboxed
+//!      child for everything off-loopback. The Everyone ACE is
+//!      belt-and-braces — a no-condition BLOCK would behave the same
+//!      — but keeping an `ALE_USER_ID` condition on every filter
+//!      makes enumeration uniform.
+//!
+//! Filters carry a small JSON tag in `providerData` (`{tool, kind}`)
+//! so install/uninstall/status can locate them by enumeration. There
+//! is no marker file: `wfp status` enumerates the live engine; `group
+//! status` queries SAM and the current token directly.
 
 // The WFP structs are large and partially-initialised; the
 // `..Default::default()` struct-update form clippy suggests is
@@ -237,17 +256,15 @@ pub struct FilterTag {
     /// Discriminator: `"srt-win"`. Anything else means the filter
     /// belongs to some other tool that happens to share our sublayer.
     pub tool: String,
-    /// User SID this filter fences (string form).
-    pub user_sid: String,
-    /// One of `permit-group`, `permit-loopback`, `block-user`.
+    /// One of `permit-nonmember`, `permit-group`, `permit-loopback`,
+    /// `block`.
     pub kind: String,
 }
 
 impl FilterTag {
-    fn new(user_sid: &str, kind: &str) -> Self {
+    fn new(kind: &str) -> Self {
         Self {
             tool: "srt-win".into(),
-            user_sid: user_sid.into(),
             kind: kind.into(),
         }
     }
@@ -437,13 +454,11 @@ fn enumerate_in(
     Ok(out)
 }
 
-/// Delete every filter under `sublayer` whose tag's `user_sid` matches
-/// (or all srt-win-tagged filters if `user_sid` is `None`). Returns the
+/// Delete every srt-win-tagged filter under `sublayer`. Returns the
 /// number deleted. Does not delete the sublayer itself.
 fn delete_tagged_filters(
     engine: &EngineHandle,
     sublayer: &GUID,
-    user_sid: Option<&str>,
 ) -> Result<usize> {
     // Re-enumerate to get filterKey GUIDs (the summary stringifies
     // them; here we need the raw GUID so walk again).
@@ -508,11 +523,7 @@ fn delete_tagged_filters(
                     };
                     serde_json::from_slice::<FilterTag>(bytes)
                         .ok()
-                        .filter(|t| t.tool == "srt-win")
-                        .map(|t| match user_sid {
-                            Some(u) => t.user_sid == u,
-                            None => true,
-                        })
+                        .map(|t| t.tool == "srt-win")
                         .unwrap_or(false)
                 } else {
                     false
@@ -597,19 +608,35 @@ fn add_filter(
     Ok(())
 }
 
-/// Install (or refresh) the six filters for `user_sid` under
-/// `sublayer`, keyed on `group_sid`. Idempotent: any existing
-/// srt-win-tagged filters for this user are deleted first, then a
-/// fresh set is added, all inside one WFP transaction.
-pub fn install_filters(
-    sublayer: &GUID,
-    group_sid: &str,
-    user_sid: &str,
-) -> Result<()> {
-    let sd_group = OwnedSd::from_sddl(&format!("O:LSD:(A;;CC;;;{group_sid})"))
+/// SDDL for filter 0 — DENY `<group_sid>` then ALLOW Everyone.
+/// `AccessCheck` against this SD grants iff the token does **not**
+/// carry the group at all (deny-only counts as carrying it). DENY
+/// before ALLOW is the canonical ACE order.
+pub fn sddl_nonmember(group_sid: &str) -> String {
+    format!("O:LSD:(D;;CC;;;{group_sid})(A;;CC;;;WD)")
+}
+
+/// SDDL for filter 1 — ALLOW `<group_sid>`. Grants iff the group is
+/// **enabled** in the token; deny-only SIDs are ignored by ALLOW
+/// ACEs.
+pub fn sddl_group(group_sid: &str) -> String {
+    format!("O:LSD:(A;;CC;;;{group_sid})")
+}
+
+/// SDDL for filter 3 — ALLOW Everyone. Grants for every token.
+pub const SDDL_EVERYONE: &str = "O:LSD:(A;;CC;;;WD)";
+
+/// Install (or refresh) the eight machine-wide filters under
+/// `sublayer`, keyed only on `group_sid`. Idempotent: any existing
+/// srt-win-tagged filters are deleted first, then a fresh set is
+/// added, all inside one WFP transaction.
+pub fn install_filters(sublayer: &GUID, group_sid: &str) -> Result<()> {
+    let sd_nonmember = OwnedSd::from_sddl(&sddl_nonmember(group_sid))
+        .context("build non-member SD")?;
+    let sd_group = OwnedSd::from_sddl(&sddl_group(group_sid))
         .context("build group SD")?;
-    let sd_user = OwnedSd::from_sddl(&format!("O:LSD:(A;;CC;;;{user_sid})"))
-        .context("build user SD")?;
+    let sd_everyone =
+        OwnedSd::from_sddl(SDDL_EVERYONE).context("build Everyone SD")?;
 
     let engine = EngineHandle::open()?;
     let rc = unsafe { FwpmTransactionBegin0(engine.h(), 0) };
@@ -649,19 +676,21 @@ pub fn install_filters(
             return Err(anyhow!("FwpmSubLayerAdd0: 0x{rc:08x}"));
         }
 
-        // Idempotency: drop any stale filters for this user before
-        // re-adding. (Inside the transaction so a crash leaves the
-        // previous state intact.)
-        let _ = delete_tagged_filters(&engine, sublayer, Some(user_sid))?;
+        // Idempotency: drop any stale filter set before re-adding.
+        // (Inside the transaction so a crash leaves the previous
+        // state intact.)
+        let _ = delete_tagged_filters(&engine, sublayer)?;
 
         // Weights — kept below 2^60 so we stay in WFP's "manual
         // weight" class (top 4 bits are auto-classifier).
-        const W_HIGH: u64 = 0x0F00_0000_0000_0000;
-        const W_MED: u64 = 0x0C00_0000_0000_0000;
-        const W_LOW: u64 = 0x0400_0000_0000_0000;
+        const W_NONMEMBER: u64 = 0x0F00_0000_0000_0000;
+        const W_GROUP: u64 = 0x0E00_0000_0000_0000;
+        const W_LOOPBACK: u64 = 0x0D00_0000_0000_0000;
+        const W_BLOCK: u64 = 0x0100_0000_0000_0000;
 
+        let mut sd_nonmember_blob = sd_nonmember.byte_blob();
         let mut sd_group_blob = sd_group.byte_blob();
-        let mut sd_user_blob = sd_user.byte_blob();
+        let mut sd_everyone_blob = sd_everyone.byte_blob();
 
         // 127.0.0.0/8
         let mut v4_loop = FWP_V4_ADDR_AND_MASK {
@@ -674,89 +703,81 @@ pub fn install_filters(
         };
         v6_loop.byteArray16[15] = 1;
 
-        let mut tag_pg = FilterTag::new(user_sid, "permit-group").to_blob_bytes();
-        let mut tag_pl = FilterTag::new(user_sid, "permit-loopback").to_blob_bytes();
-        let mut tag_bu = FilterTag::new(user_sid, "block-user").to_blob_bytes();
+        let mut tag_nm = FilterTag::new("permit-nonmember").to_blob_bytes();
+        let mut tag_gp = FilterTag::new("permit-group").to_blob_bytes();
+        let mut tag_lb = FilterTag::new("permit-loopback").to_blob_bytes();
+        let mut tag_bk = FilterTag::new("block").to_blob_bytes();
 
-        // ── IPv4 ──
-        let mut c1 =
-            [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_group_blob)];
-        add_filter(
-            engine.h(),
-            sublayer,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            "srt-win-v4-permit-group",
-            W_HIGH,
-            FWP_ACTION_PERMIT,
-            &mut c1,
-            &mut tag_pg,
-        )?;
-        let mut c2 = [
-            cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_user_blob),
-            cond_v4_subnet(FWPM_CONDITION_IP_REMOTE_ADDRESS, &mut v4_loop),
-        ];
-        add_filter(
-            engine.h(),
-            sublayer,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            "srt-win-v4-permit-loopback",
-            W_MED,
-            FWP_ACTION_PERMIT,
-            &mut c2,
-            &mut tag_pl,
-        )?;
-        let mut c3 =
-            [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_user_blob)];
-        add_filter(
-            engine.h(),
-            sublayer,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            "srt-win-v4-block-user",
-            W_LOW,
-            FWP_ACTION_BLOCK,
-            &mut c3,
-            &mut tag_bu,
-        )?;
+        for (layer, label) in [
+            (FWPM_LAYER_ALE_AUTH_CONNECT_V4, "v4"),
+            (FWPM_LAYER_ALE_AUTH_CONNECT_V6, "v6"),
+        ] {
+            // 0 — PERMIT non-member.
+            let mut c0 = [cond_sd(
+                FWPM_CONDITION_ALE_USER_ID,
+                &mut sd_nonmember_blob,
+            )];
+            add_filter(
+                engine.h(),
+                sublayer,
+                layer,
+                &format!("srt-win-{label}-permit-nonmember"),
+                W_NONMEMBER,
+                FWP_ACTION_PERMIT,
+                &mut c0,
+                &mut tag_nm,
+            )?;
 
-        // ── IPv6 ──
-        let mut c4 =
-            [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_group_blob)];
-        add_filter(
-            engine.h(),
-            sublayer,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            "srt-win-v6-permit-group",
-            W_HIGH,
-            FWP_ACTION_PERMIT,
-            &mut c4,
-            &mut tag_pg,
-        )?;
-        let mut c5 = [
-            cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_user_blob),
-            cond_v6_addr(FWPM_CONDITION_IP_REMOTE_ADDRESS, &mut v6_loop),
-        ];
-        add_filter(
-            engine.h(),
-            sublayer,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            "srt-win-v6-permit-loopback",
-            W_MED,
-            FWP_ACTION_PERMIT,
-            &mut c5,
-            &mut tag_pl,
-        )?;
-        let mut c6 =
-            [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_user_blob)];
-        add_filter(
-            engine.h(),
-            sublayer,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-            "srt-win-v6-block-user",
-            W_LOW,
-            FWP_ACTION_BLOCK,
-            &mut c6,
-            &mut tag_bu,
-        )?;
+            // 1 — PERMIT group-enabled.
+            let mut c1 =
+                [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_group_blob)];
+            add_filter(
+                engine.h(),
+                sublayer,
+                layer,
+                &format!("srt-win-{label}-permit-group"),
+                W_GROUP,
+                FWP_ACTION_PERMIT,
+                &mut c1,
+                &mut tag_gp,
+            )?;
+
+            // 2 — PERMIT loopback (no user condition).
+            let mut c2 = if label == "v4" {
+                [cond_v4_subnet(
+                    FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                    &mut v4_loop,
+                )]
+            } else {
+                [cond_v6_addr(FWPM_CONDITION_IP_REMOTE_ADDRESS, &mut v6_loop)]
+            };
+            add_filter(
+                engine.h(),
+                sublayer,
+                layer,
+                &format!("srt-win-{label}-permit-loopback"),
+                W_LOOPBACK,
+                FWP_ACTION_PERMIT,
+                &mut c2,
+                &mut tag_lb,
+            )?;
+
+            // 3 — BLOCK Everyone.
+            let mut c3 = [cond_sd(
+                FWPM_CONDITION_ALE_USER_ID,
+                &mut sd_everyone_blob,
+            )];
+            add_filter(
+                engine.h(),
+                sublayer,
+                layer,
+                &format!("srt-win-{label}-block"),
+                W_BLOCK,
+                FWP_ACTION_BLOCK,
+                &mut c3,
+                &mut tag_bk,
+            )?;
+        }
 
         Ok(())
     })();
@@ -774,19 +795,16 @@ pub fn install_filters(
     Ok(())
 }
 
-/// Remove the filters for `user_sid` (or all srt-win filters if `None`)
-/// under `sublayer`. If the sublayer ends up empty, attempt to delete
-/// it too (best-effort; another user's filters may keep it busy).
-pub fn uninstall_filters(
-    sublayer: &GUID,
-    user_sid: Option<&str>,
-) -> Result<usize> {
+/// Remove every srt-win-tagged filter under `sublayer`, then attempt
+/// to delete the sublayer itself (best-effort; `FWP_E_IN_USE` means
+/// foreign filters are still under it).
+pub fn uninstall_filters(sublayer: &GUID) -> Result<usize> {
     let engine = EngineHandle::open()?;
     let rc = unsafe { FwpmTransactionBegin0(engine.h(), 0) };
     if rc != 0 {
         return Err(anyhow!("FwpmTransactionBegin0: 0x{rc:08x}"));
     }
-    let n = match delete_tagged_filters(&engine, sublayer, user_sid) {
+    let n = match delete_tagged_filters(&engine, sublayer) {
         Ok(n) => n,
         Err(e) => {
             unsafe {
@@ -795,7 +813,7 @@ pub fn uninstall_filters(
             return Err(e);
         }
     };
-    // Try to delete the sublayer; FWP_E_IN_USE means another user's
+    // Try to delete the sublayer; FWP_E_IN_USE means foreign
     // filters are still under it — fine.
     let rc = unsafe { FwpmSubLayerDeleteByKey0(engine.h(), sublayer) };
     if rc != 0
@@ -815,38 +833,24 @@ pub fn uninstall_filters(
     Ok(n)
 }
 
-/// Status of the WFP fence for `user_sid`. `installed` iff at least
-/// one `block-user` and one `permit-group` srt-win filter for that
-/// user exist under `sublayer`. (We don't insist on an exact count so
-/// enterprise tooling that adds extras under the same sublayer
-/// doesn't break detection.)
+/// Status of the WFP fence under `sublayer`. `installed` iff at
+/// least one `permit-group` and one `block` srt-win filter exist.
+/// (We don't insist on the exact count so enterprise tooling that
+/// adds extras under the same sublayer doesn't break detection.)
 #[derive(Debug, Serialize)]
 pub struct WfpStatus {
     pub state: &'static str,
     pub filters: usize,
 }
 
-pub fn filter_status(sublayer: &GUID, user_sid: &str) -> Result<WfpStatus> {
+pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
     let all = enumerate_filters(sublayer)?;
-    let mine: Vec<_> = all
-        .iter()
-        .filter(|f| {
-            f.tag
-                .as_ref()
-                .map(|t| t.user_sid == user_sid)
-                .unwrap_or(false)
-        })
-        .collect();
-    let has_block = mine
-        .iter()
-        .any(|f| f.tag.as_ref().map(|t| t.kind == "block-user").unwrap_or(false));
-    let has_permit_group = mine.iter().any(|f| {
-        f.tag
-            .as_ref()
-            .map(|t| t.kind == "permit-group")
-            .unwrap_or(false)
-    });
-    let state = if has_block && has_permit_group {
+    let mine: Vec<_> = all.iter().filter(|f| f.tag.is_some()).collect();
+    let has = |k: &str| {
+        mine.iter()
+            .any(|f| f.tag.as_ref().map(|t| t.kind == k).unwrap_or(false))
+    };
+    let state = if has("permit-group") && has("block") {
         "installed"
     } else {
         "absent"
@@ -880,14 +884,14 @@ pub fn parse_guid(s: &str) -> Result<GUID> {
 mod tests {
     use super::*;
 
-    /// SDDL templates used by `install_filters` must parse for
-    /// representative SIDs. Catches template typos without needing a
-    /// live WFP engine.
+    /// All three SDDL templates used by `install_filters` must
+    /// parse for a representative SID. Catches template typos
+    /// without needing a live WFP engine.
     #[test]
     fn sddl_templates_parse() {
-        for sid in ["S-1-5-32-545", "S-1-5-18"] {
-            let sd = OwnedSd::from_sddl(&format!("O:LSD:(A;;CC;;;{sid})"))
-                .expect("sddl");
+        let g = "S-1-5-32-545";
+        for sddl in [sddl_nonmember(g), sddl_group(g), SDDL_EVERYONE.into()] {
+            let sd = OwnedSd::from_sddl(&sddl).expect("sddl");
             assert!(!sd.ptr.0.is_null());
             assert!(sd.len > 0);
         }
@@ -900,7 +904,7 @@ mod tests {
 
     #[test]
     fn filter_tag_round_trip() {
-        let t = FilterTag::new("S-1-5-21-1-2-3-1000", "block-user");
+        let t = FilterTag::new("block");
         let bytes = t.to_blob_bytes();
         let back: FilterTag = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(t, back);
