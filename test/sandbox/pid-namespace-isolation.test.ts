@@ -25,13 +25,19 @@ let applySeccomp: string | null = null
 function runApplySeccomp(
   args: string[],
   opts: { timeout?: number } = {},
-): { status: number | null; stdout: string; stderr: string } {
+): {
+  status: number | null
+  signal: NodeJS.Signals | null
+  stdout: string
+  stderr: string
+} {
   const r = spawnSync(applySeccomp!, args, {
     stdio: 'pipe',
     timeout: opts.timeout ?? 10000,
   })
   return {
     status: r.status,
+    signal: r.signal,
     stdout: r.stdout?.toString() ?? '',
     stderr: r.stderr?.toString() ?? '',
   }
@@ -85,15 +91,17 @@ describe.if(isLinux)('apply-seccomp PID namespace isolation', () => {
     expect(runApplySeccomp(['sh', '-c', 'exit 127']).status).toBe(127)
   })
 
-  it('forwards signal exits as 128+signo', () => {
+  it('relays signal exits as WIFSIGNALED (re-raises the signal)', () => {
     const r = runApplySeccomp(['sh', '-c', 'kill -TERM $$'])
-    expect(r.status).toBe(128 + 15)
+    expect(r.signal).toBe('SIGTERM')
+    expect(r.status).toBeNull()
   })
 
   it('forwards SIGTERM from the outside through both inits to the command', () => {
     // PID 1 drops signals it has no handler for. apply-seccomp's inner init
     // must install handlers so SIGTERM from the caller actually reaches the
-    // workload.
+    // workload. timeout(1) converts a signaled child back to 128+signo, so
+    // this assertion is unchanged by the WIFSIGNALED relay.
     const r = spawnSync(
       'timeout',
       ['--preserve-status', '-s', 'TERM', '1', applySeccomp!, 'sleep', '10'],
