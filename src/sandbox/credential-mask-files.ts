@@ -49,8 +49,8 @@ export function extractPlaceholder(i: number): string {
 
 /**
  * Result of {@link extractAndSubstitute}: the file content with each
- * distinct captured credential replaced by `extractPlaceholder(i)`, plus
- * the captures themselves in placeholder-index order.
+ * matched capture-group-1 span replaced by `sentinelFor(capture, i)`,
+ * plus the distinct captured values in first-seen (index) order.
  */
 export interface ExtractResult {
   fakeContent: string
@@ -58,9 +58,26 @@ export interface ExtractResult {
 }
 
 /**
- * Apply `pattern` globally to `content`, collect the distinct capture-group-1
- * values in first-seen order, and return `content` with each occurrence of a
- * captured value replaced by its index placeholder.
+ * `RegExpMatchArray` with the `d`-flag indices array. The project targets
+ * ES2020 so `lib.es2022.regexp` is not loaded, but Node ≥18 (the engine
+ * floor) supports `hasIndices` at runtime.
+ */
+type MatchWithIndices = RegExpMatchArray & {
+  indices: Array<[number, number] | undefined>
+}
+
+/**
+ * Apply `pattern` globally to `content` and return `content` with each
+ * matched capture-group-1 span replaced by `sentinelFor(capture, i)`,
+ * where `i` is the zero-based index of the distinct captured value in
+ * first-seen order.
+ *
+ * Single pass, offset-based: the regex `d` flag exposes capture-group
+ * offsets, so the output is built by slicing between matches and
+ * splicing the sentinel in at the exact `[start, end)` of group 1. Only
+ * the regex-matched span is replaced — a captured value that
+ * coincidentally appears elsewhere in the file (outside any match) is
+ * left intact. No placeholder pass, no substring-ordering concern.
  *
  * Returns `null` when the pattern matches nothing — the caller treats that
  * as fail-open (skip the entry, leave the file readable as-is) with a loud
@@ -72,18 +89,20 @@ export interface ExtractResult {
  * and absent for some match (e.g. `"token: (\\S+)?"`); accepting that
  * would silently mask nothing for that occurrence.
  *
- * Pure: no registry, no filesystem, deterministic placeholders — testable
- * in isolation.
+ * Pure on `content`/`pattern`; the callback may close over a registry.
  */
 export function extractAndSubstitute(
   content: string,
   pattern: string,
+  sentinelFor: (capture: string, index: number) => string,
 ): ExtractResult | null {
-  // The schema validates `pattern` compiles; recompiling here with `g` is
-  // what makes matchAll iterate every occurrence.
-  const re = new RegExp(pattern, 'g')
+  // The schema validates `pattern` compiles; `g` makes matchAll iterate
+  // every occurrence and `d` populates `m.indices` with group offsets.
+  const re = new RegExp(pattern, 'gd')
   const indexByCapture = new Map<string, number>()
-  for (const m of content.matchAll(re)) {
+  let out = ''
+  let pos = 0
+  for (const m of content.matchAll(re) as IterableIterator<MatchWithIndices>) {
     const cap = m[1]
     if (cap === undefined) {
       throw new Error(
@@ -92,29 +111,19 @@ export function extractAndSubstitute(
           `credential value on every match.`,
       )
     }
-    // Empty captures are skipped: replacing the empty string is a no-op
-    // semantically and split('').join(marker) would interleave a marker
-    // between every character.
+    // Empty captures are skipped: a zero-width span has nothing to mask.
     if (cap.length === 0) continue
-    if (!indexByCapture.has(cap)) {
-      indexByCapture.set(cap, indexByCapture.size)
-    }
+    let i = indexByCapture.get(cap)
+    if (i === undefined) indexByCapture.set(cap, (i = indexByCapture.size))
+    const [start, end] = m.indices[1]!
+    out += content.slice(pos, start) + sentinelFor(cap, i)
+    pos = end
   }
   if (indexByCapture.size === 0) return null
-
-  // Replace longest captures first so a capture that is a substring of
-  // another (rare for tokens, but cheap to guard) cannot corrupt the longer
-  // one's bytes mid-replacement. Placeholders contain NUL, so a later pass
-  // can never re-match inside an already-substituted span.
-  const byLengthDesc = [...indexByCapture.entries()].sort(
-    (a, b) => b[0].length - a[0].length,
-  )
-  let fakeContent = content
-  for (const [cap, i] of byLengthDesc) {
-    fakeContent = fakeContent.split(cap).join(extractPlaceholder(i))
+  return {
+    fakeContent: out + content.slice(pos),
+    captures: [...indexByCapture.keys()],
   }
-  const captures = [...indexByCapture.keys()]
-  return { fakeContent, captures }
 }
 
 /** One masked file's bind mapping for the platform builder. */
