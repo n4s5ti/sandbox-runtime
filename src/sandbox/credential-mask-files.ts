@@ -275,7 +275,9 @@ export function buildMaskedFileBinds(
       // Whole-file: one sentinel for the entire content.
       fakeContent = registry.register(key, content, injectHosts)
     } else {
-      const extracted = extractAndSubstitute(content, f.extract)
+      const extracted = extractAndSubstitute(content, f.extract, (cap, i) =>
+        registry.register(`${key}#${i}`, cap, injectHosts),
+      )
       if (extracted === null) {
         // Fail-open: a non-matching extract pattern is a config error to
         // surface, not a reason to block file access. Skip the entry (no
@@ -291,10 +293,6 @@ export function buildMaskedFileBinds(
         continue
       }
       fakeContent = extracted.fakeContent
-      for (const [i, cap] of extracted.captures.entries()) {
-        const sentinel = registry.register(`${key}#${i}`, cap, injectHosts)
-        fakeContent = fakeContent.split(extractPlaceholder(i)).join(sentinel)
-      }
     }
 
     const fakePath = store.write(key, fakeContent)
