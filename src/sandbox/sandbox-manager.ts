@@ -1,6 +1,8 @@
 import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
+import { createMuxProxyServer, type MuxProxyServer } from './mux-proxy.js'
+import { listenInRange } from './listen-in-range.js'
 import { SentinelRegistry } from './credential-sentinel.js'
 import {
   MaskedFileStore,
@@ -81,6 +83,7 @@ interface HostNetworkManagerContext {
 let config: SandboxRuntimeConfig | undefined
 let httpProxyServer: ReturnType<typeof createHttpProxyServer> | undefined
 let socksProxyServer: SocksProxyWrapper | undefined
+let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
@@ -249,70 +252,9 @@ function getMitmSocketPath(host: string): string | undefined {
   return undefined
 }
 
-/**
- * Bind `server.listen()` to the first free port in `[lo, hi]`,
- * skipping `EADDRINUSE`. With `range` undefined, binds to ephemeral
- * port 0 (the previous behaviour).
- *
- * Used on Windows: the WFP loopback permit only covers a fixed port
- * range (default 60080–60089), so the JS proxies must bind inside it
- * for the sandboxed child to reach them. On other platforms the
- * sandbox layer (seatbelt rule, namespace+socat) targets whatever
- * port we landed on, so ephemeral is fine.
- */
-function listenInRange(
-  server: {
-    once(ev: 'error' | 'listening', cb: (e?: Error) => void): unknown
-    removeListener(ev: 'error' | 'listening', cb: (e?: Error) => void): unknown
-  },
-  doListen: (port: number) => void,
-  range: readonly [number, number] | undefined,
-  exclude: ReadonlySet<number>,
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const [lo, hi] = range ?? [0, 0]
-    let port = lo
-    const tryNext = (): void => {
-      while (exclude.has(port) && port <= hi) port++
-      if (port > hi) {
-        reject(
-          new Error(
-            `No free port in range ${lo}-${hi} (excluding ${[...exclude].join(',')})`,
-          ),
-        )
-        return
-      }
-      const onListening = (): void => {
-        server.removeListener('error', onError)
-        resolve()
-      }
-      const onError = (err?: Error): void => {
-        // The paired 'listening' once-listener never fired; drop it
-        // so retries don't accumulate stale listeners.
-        server.removeListener('listening', onListening)
-        if (
-          range &&
-          (err as NodeJS.ErrnoException)?.code === 'EADDRINUSE' &&
-          port < hi
-        ) {
-          port++
-          tryNext()
-          return
-        }
-        reject(err ?? new Error('listen error'))
-      }
-      server.once('error', onError)
-      server.once('listening', onListening)
-      doListen(range ? port : 0)
-    }
-    tryNext()
-  })
-}
-
-async function startHttpProxyServer(
+async function startMuxProxyServer(
   sandboxAskCallback: SandboxAskCallback | undefined,
   portRange: readonly [number, number] | undefined,
-  excludePorts: ReadonlySet<number>,
 ): Promise<number> {
   const injectCredentials = buildCredentialInjector()
   httpProxyServer = createHttpProxyServer({
@@ -332,27 +274,6 @@ async function startHttpProxyServer(
     proxyAuthToken,
   })
 
-  const server = httpProxyServer
-  await listenInRange(
-    server,
-    p => server.listen(p, '127.0.0.1'),
-    portRange,
-    excludePorts,
-  )
-  const address = server.address()
-  if (!address || typeof address !== 'object') {
-    throw new Error('Failed to get HTTP proxy server address')
-  }
-  server.unref()
-  logForDebugging(`HTTP proxy listening on localhost:${address.port}`)
-  return address.port
-}
-
-async function startSocksProxyServer(
-  sandboxAskCallback: SandboxAskCallback | undefined,
-  portRange: readonly [number, number] | undefined,
-  excludePorts: ReadonlySet<number>,
-): Promise<number> {
   socksProxyServer = createSocksProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
@@ -360,32 +281,30 @@ async function startSocksProxyServer(
     proxyAuthToken,
   })
 
-  const wrapper = socksProxyServer
-  // SocksProxyWrapper.listen() resolves with the bound port; we
-  // adapt it to the listenInRange shape by retrying on EADDRINUSE
-  // here directly rather than via the once('error') path.
-  if (!portRange) {
-    const port = await wrapper.listen(0, '127.0.0.1')
-    wrapper.unref()
-    return port
-  }
-  let lastErr: unknown
-  for (let p = portRange[0]; p <= portRange[1]; p++) {
-    if (excludePorts.has(p)) continue
-    try {
-      const port = await wrapper.listen(p, '127.0.0.1')
-      wrapper.unref()
-      return port
-    } catch (err) {
-      lastErr = err
-      if ((err as NodeJS.ErrnoException)?.code !== 'EADDRINUSE') throw err
-    }
-  }
-  throw new Error(
-    `No free SOCKS port in range ${portRange[0]}-${portRange[1]}: ${
-      (lastErr as Error)?.message ?? 'all in use'
-    }`,
+  muxProxyServer = createMuxProxyServer({
+    httpServer: httpProxyServer,
+    handleSocksConnection: s => socksProxyServer!.handleConnection(s),
+    httpBackendPortRange: portRange,
+  })
+
+  const mux = muxProxyServer
+  // Backend first so the front-end never accepts a connection that would
+  // dispatch to an unbound backend. On Windows the backend's port is
+  // excluded when binding the front-end in the same WFP range.
+  const backendPort = await mux.listenHttpBackend()
+  await listenInRange(
+    mux.server,
+    p => mux.server.listen(p, '127.0.0.1'),
+    portRange,
+    backendPort !== undefined ? new Set([backendPort]) : new Set(),
   )
+  const muxPort = mux.getPort()
+  if (muxPort === undefined) {
+    throw new Error('Failed to get mux proxy server port')
+  }
+  mux.unref()
+  logForDebugging(`Mux proxy (HTTP+SOCKS) listening on localhost:${muxPort}`)
+  return muxPort
 }
 
 // ============================================================================
@@ -504,33 +423,24 @@ async function initialize(
         config.network.httpProxyPort !== undefined
           ? undefined
           : randomBytes(16).toString('hex')
-      let httpProxyPort: number
-      if (config.network.httpProxyPort !== undefined) {
-        // Use external HTTP proxy (don't start a server)
-        httpProxyPort = config.network.httpProxyPort
-        logForDebugging(`Using external HTTP proxy on port ${httpProxyPort}`)
-      } else {
-        // Start local HTTP proxy
-        httpProxyPort = await startHttpProxyServer(
-          sandboxAskCallback,
-          portRange,
-          new Set(),
-        )
-      }
 
-      let socksProxyPort: number
+      // The mux front-end serves both protocols on one port. Each side's
+      // reported port is the external override if configured, else the mux
+      // port — so the public config.network.{http,socks}ProxyPort contract
+      // is unchanged. The mux is skipped only when BOTH are external.
+      const needLocalProxy =
+        config.network.httpProxyPort === undefined ||
+        config.network.socksProxyPort === undefined
+      const muxPort = needLocalProxy
+        ? await startMuxProxyServer(sandboxAskCallback, portRange)
+        : undefined
+      const httpProxyPort = config.network.httpProxyPort ?? muxPort!
+      const socksProxyPort = config.network.socksProxyPort ?? muxPort!
+      if (config.network.httpProxyPort !== undefined) {
+        logForDebugging(`Using external HTTP proxy on port ${httpProxyPort}`)
+      }
       if (config.network.socksProxyPort !== undefined) {
-        // Use external SOCKS proxy (don't start a server)
-        socksProxyPort = config.network.socksProxyPort
         logForDebugging(`Using external SOCKS proxy on port ${socksProxyPort}`)
-      } else {
-        // Start local SOCKS proxy. Skip the port the HTTP proxy
-        // already took.
-        socksProxyPort = await startSocksProxyServer(
-          sandboxAskCallback,
-          portRange,
-          new Set([httpProxyPort]),
-        )
       }
 
       // Initialize platform-specific infrastructure
@@ -1646,6 +1556,16 @@ async function reset(): Promise<void> {
     closePromises.push(disposeMitmCA(mitmCA))
   }
 
+  if (muxProxyServer) {
+    closePromises.push(
+      muxProxyServer.close().catch((error: Error) => {
+        logForDebugging(`Error closing mux proxy server: ${error.message}`, {
+          level: 'error',
+        })
+      }),
+    )
+  }
+
   if (httpProxyServer) {
     closePromises.push(forceCloseHttpServer(httpProxyServer))
   }
@@ -1663,6 +1583,7 @@ async function reset(): Promise<void> {
   await Promise.all(closePromises)
 
   // Clear references
+  muxProxyServer = undefined
   httpProxyServer = undefined
   proxyAuthToken = undefined
   socksProxyServer = undefined

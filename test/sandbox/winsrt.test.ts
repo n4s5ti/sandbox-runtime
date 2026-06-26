@@ -520,18 +520,19 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     expect(argv).not.toContain('--http-proxy')
     expect(argv).not.toContain('--socks-proxy')
 
-    // Standard proxy vars present and pointed at an in-range port.
+    // Standard proxy vars present and pointed at the in-range mux port.
+    // The mux serves both protocols on one port. ALL_PROXY is advertised
+    // as http:// (not socks5h://) so httpx-style clients don't try to
+    // import a SOCKS dependency; the mux still answers SOCKS on that port.
     const httpProxy = env.HTTP_PROXY ?? env.http_proxy
     const allProxy = env.ALL_PROXY ?? env.all_proxy
     expect(httpProxy).toMatch(/^http:\/\/.+:\d+$/)
-    expect(allProxy).toMatch(/^socks5h:\/\/.+:\d+$/)
+    expect(allProxy).toMatch(/^http:\/\/.+:\d+$/)
     const httpPort = Number(httpProxy!.split(':').pop())
     const socksPort = Number(allProxy!.split(':').pop())
     expect(httpPort).toBeGreaterThanOrEqual(PORT_RANGE[0])
     expect(httpPort).toBeLessThanOrEqual(PORT_RANGE[1])
-    expect(socksPort).toBeGreaterThanOrEqual(PORT_RANGE[0])
-    expect(socksPort).toBeLessThanOrEqual(PORT_RANGE[1])
-    expect(httpPort).not.toBe(socksPort)
+    expect(httpPort).toBe(socksPort)
 
     // The FULL set rides along, not just the standard trio — assert an
     // extra var from generateProxyEnvVars is present too.
