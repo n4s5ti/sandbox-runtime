@@ -181,7 +181,13 @@ enum Cmd {
         /// child. Requires `srt-win install` to have provisioned
         /// the user (exit **15** otherwise). Opt-in — without this
         /// flag the same-user deny-only-group path is unchanged.
-        #[arg(long)]
+        /// Mutually exclusive with the `SameUser`-mode discriminator
+        /// flags (`--group-sid` / `--skip-group-check`): the
+        /// separate-user model has no discriminator group.
+        #[arg(
+            long,
+            conflicts_with_all = ["group_sid", "skip_group_check"],
+        )]
         as_sandbox_user: bool,
         /// `KEY=VALUE` pair overlaid on the sandbox-user runner's
         /// profile environment when building the child's env block
@@ -657,9 +663,10 @@ enum PerExecRestore {
         dacls: srt_win::acl::PrebuiltDacls,
     },
     /// Separate-user model: DENY-ACE release via
-    /// `release_aces(KIND_DENY)`.
+    /// `release_aces(KIND_DENY)`. The state-DB / init-mutex
+    /// discriminator is the SANDBOX user SID (`with_init_lock`'s
+    /// first arg) — the discriminator group is `SameUser`-only.
     SandboxUser {
-        gsid: String,
         holder: srt_win::state_db::HolderPid,
         sandbox_sid: String,
     },
@@ -689,9 +696,9 @@ impl Drop for PerExecRestore {
                     Err(e) => (0, Some(e)),
                 }
             }
-            Self::SandboxUser { gsid, holder, sandbox_sid } => {
+            Self::SandboxUser { holder, sandbox_sid } => {
                 match state_db::with_init_lock(
-                    gsid, *holder, None, false,
+                    sandbox_sid, *holder, None, false,
                     |db| {
                         db.release_aces(sandbox_sid, state_db::KIND_DENY)
                     },
@@ -1124,7 +1131,10 @@ fn run() -> anyhow::Result<()> {
             use srt_win::install;
             let der = read_ca_der(&path)?;
             let cred = install::read_cred()?;
-            install::trust_ca(&der, &cred)?;
+            let sb_sid = install::read_setup()?
+                .ok_or_else(|| anyhow!("sandbox user not provisioned"))?
+                .sandbox_user_sid;
+            install::trust_ca(&der, &cred, &sb_sid)?;
             eprintln!(
                 "srt-win: CA installed into sandbox-user Root \
                  (thumb={})",
@@ -1269,15 +1279,21 @@ fn run() -> anyhow::Result<()> {
             // listener bound outside the WFP permit range so
             // fence-missing is distinguishable from fence-active
             // without depending on any external host.
-            let cred = match install::read_cred() {
-                Ok(c) => c,
+            let r = install::read_cred().and_then(|c| {
+                let s = install::read_setup()?.ok_or_else(|| {
+                    anyhow!("sandbox user not provisioned")
+                })?;
+                Ok((s.sandbox_user_sid, c))
+            });
+            let (sb_sid, cred) = match r {
+                Ok(v) => v,
                 Err(e) => {
                     eprintln!("srt-win: error: wfp verify: {e:#}");
                     std::process::exit(15);
                 }
             };
             let code = logon::spawn_runner(
-                &cred.user, &cred.pw, None,
+                &cred.user, &cred.pw, &sb_sid, None,
                 &runner::RunnerCmd::ProbeEgress { target: target.clone() },
             )
             .context("spawn runner for egress probe")?;
@@ -1774,7 +1790,6 @@ fn run() -> anyhow::Result<()> {
             target,
         } => {
             use srt_win::{acl, launch, state_db};
-            let gsid = resolve_group_sid(&group)?;
             // No WFP pre-flight here: BFE enumeration is
             // admin-gated, so a non-elevated broker can't read it.
             // The fence is verified BEHAVIORALLY by `srt-win wfp
@@ -1866,7 +1881,6 @@ fn run() -> anyhow::Result<()> {
                 // the same-user `refuse_escalation` guard is not
                 // needed.
                 let own = state_db::HolderPid(std::process::id());
-                let gsid_for_guard = gsid.clone();
                 let sb = sb_sid.clone();
                 let (targets, bad) = canonicalize_ace_targets(
                     "deny",
@@ -1883,7 +1897,7 @@ fn run() -> anyhow::Result<()> {
                 }
                 let n = targets.len();
                 let ((_w, failed), _r) = state_db::with_init_lock(
-                    &gsid, own, None, false,
+                    &sb, own, None, false,
                     |db| db.apply_aces(&sb, &targets),
                 )
                 .context("per-exec deny-ace")?;
@@ -1894,7 +1908,6 @@ fn run() -> anyhow::Result<()> {
                     ));
                 }
                 let guard = PerExecRestore::SandboxUser {
-                    gsid: gsid_for_guard,
                     holder: own,
                     sandbox_sid: sb,
                 };
@@ -1905,6 +1918,7 @@ fn run() -> anyhow::Result<()> {
                 );
                 Some(guard)
             } else {
+                let gsid = resolve_group_sid(&group)?;
                 let dacls = acl::PrebuiltDacls::for_current_user(&gsid)?;
                 let own = state_db::HolderPid(std::process::id());
                 // Owned copy for the Drop guard — taken now so
@@ -1986,14 +2000,18 @@ fn run() -> anyhow::Result<()> {
                 Some(PerExecRestore::SandboxUser { .. }) | None => None,
             };
 
-            let code = if let Some((_sb_sid, cred)) = sandbox_cred {
+            let code = if let Some((sb_sid, cred)) = sandbox_cred {
                 // Two-hop launch.
                 use srt_win::{logon, runner};
-                // Self-protect the BROKER (real user, group enabled)
-                // before the logon. The runner self-protects too;
-                // this covers the broker→child hop. Best-effort.
+                // Self-protect the BROKER before the logon. The
+                // discriminator is the REAL USER's SID (broker is the
+                // real user; child is `srt-sandbox`) — NOT the group
+                // SID, which is the `SameUser` discriminator. The
+                // runner self-protects too; this covers the
+                // broker→child hop. Best-effort.
+                let real_user = srt_win::sid::current_user_sid()?;
                 if let Err(e) =
-                    srt_win::self_protect::install_broker_dacl(Some(&gsid))
+                    srt_win::self_protect::install_broker_dacl(Some(&real_user))
                 {
                     eprintln!(
                         "srt-win: WARNING: install_broker_dacl: {e:#}"
@@ -2027,7 +2045,7 @@ fn run() -> anyhow::Result<()> {
                     .ok()
                     .and_then(|p| p.to_str().map(String::from));
                 logon::spawn_runner(
-                    &cred.user, &cred.pw, cwd.as_deref(),
+                    &cred.user, &cred.pw, &sb_sid, cwd.as_deref(),
                     &runner::RunnerCmd::Exec(runner::RunnerSpec {
                         argv: target.clone(),
                         env_overlay,
@@ -2040,7 +2058,7 @@ fn run() -> anyhow::Result<()> {
                     &exe,
                     args,
                     &launch::LaunchMode::SameUser {
-                        group_sid: gsid.clone(),
+                        group_sid: resolve_group_sid(&group)?,
                         skip_group_check,
                     },
                 )?

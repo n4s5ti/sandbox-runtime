@@ -64,6 +64,13 @@ impl Drop for LocalPsid {
     }
 }
 
+/// String SID → owned self-relative SID bytes. Cast `.as_ptr()` to
+/// `PSID` for Win32 calls; the buffer is the canonical wire form so
+/// byte-equality is SID-equality.
+pub fn sid_bytes(sid_str: &str) -> Result<Vec<u8>> {
+    Ok(LocalPsid::from_string(sid_str)?.as_bytes().to_vec())
+}
+
 /// Stringify a `PSID`. Used for serialisation and logging.
 pub fn psid_to_string(sid: PSID) -> Result<String> {
     let mut p = PWSTR::null();

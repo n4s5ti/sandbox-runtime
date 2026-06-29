@@ -523,7 +523,10 @@ Write-Host 'V1 ok: wfp verify reports egress_probe=blocked'
 # PATH-with-spaces.
 function RExec {
   param([string[]] $tail)
-  $argv = @('exec', '--group-sid', $GroupSid,
+  # No --group-sid: RExec is the SandboxUser path; --group-sid is the
+  # SameUser-mode discriminator and is mutually exclusive with
+  # --as-sandbox-user.
+  $argv = @('exec',
             '--as-sandbox-user',
             '--env', "PATH=$($env:PATH)",
             '--env', "PATHEXT=$($env:PATHEXT)") + $tail
@@ -532,6 +535,7 @@ function RExec {
   $psi.UseShellExecute        = $false
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError  = $true
+  $psi.Environment['SANDBOX_RUNTIME_WIN_DEBUG'] = '1'
   foreach ($a in $argv) { $null = $psi.ArgumentList.Add($a) }
   $p  = [System.Diagnostics.Process]::Start($psi)
   # Drain both pipes concurrently so a full pipe buffer can't wedge
@@ -682,6 +686,89 @@ if ($r.out -notmatch 'DENIED:runner') {
   throw "R9b: expected ACCESS_DENIED for runner target. raw: $($r.raw)"
 }
 Write-Host 'R9b ok: child denied PROCESS_CREATE_PROCESS on the runner (self-protect holds)'
+
+# ── R11: child cannot OpenProcess(PROCESS_VM_READ) on a default-DACL ──
+#         real-user process (logon-SID strip).
+# seclogon stamps the broker's interactive logon SID into the
+# runner's token; CreateRestrictedToken disables it so the child
+# does NOT match the default per-process logon-session ACE
+# (VM_READ|QUERY|TERMINATE) on same-session real-user processes.
+# Without the strip the child can ReadProcessMemory the broker's
+# browser/shell/host orchestrator. Spawn a fresh victim under the
+# broker user so the target is unambiguously default-DACL (no
+# harness side effects on its SD).
+$victim = Start-Process -FilePath $cmd -ArgumentList '/c','timeout /t 60 >nul' `
+            -PassThru -WindowStyle Hidden
+try {
+  $probeR11 = @"
+`$sig = '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenProcess(uint a,bool b,uint p);'
+`$k32 = Add-Type -MemberDefinition `$sig -Name K32V -Namespace W -PassThru
+function Probe([string]`$tag, [uint32]`$mask) {
+  `$h = `$k32::OpenProcess(`$mask, `$false, $($victim.Id))
+  `$le = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+  if (`$h -ne [System.IntPtr]::Zero) { "OPENED:`$tag" }
+  elseif (`$le -eq 5)                { "DENIED:`$tag" }
+  else                               { "OTHER:`$tag le=`$le" }
+}
+# 0x0010 = PROCESS_VM_READ; 0x1000 = PROCESS_QUERY_LIMITED_INFORMATION
+Probe 'vm-read'  0x0010
+Probe 'query-li' 0x1000
+"@
+  $r = RExec @('--', $pwsh, '-NoProfile', '-Command', $probeR11)
+  Write-Host "R11 probe output: $($r.out.Trim())"
+  if ($r.out -match 'OPENED:vm-read') {
+    throw "R11: child got PROCESS_VM_READ on a default-DACL " +
+          "real-user process (logon-SID not stripped — child " +
+          "can ReadProcessMemory the broker's session). raw: $($r.raw)"
+  }
+  if ($r.out -notmatch 'DENIED:vm-read') {
+    throw "R11: expected ACCESS_DENIED for VM_READ. raw: $($r.raw)"
+  }
+  if ($r.out -match 'OPENED:query-li') {
+    throw "R11: child got PROCESS_QUERY_LIMITED_INFORMATION on a " +
+          "default-DACL real-user process. raw: $($r.raw)"
+  }
+  if ($r.out -notmatch 'DENIED:query-li') {
+    throw "R11: expected ACCESS_DENIED for QUERY_LIMITED. raw: $($r.raw)"
+  }
+  Write-Host ('R11 ok: child denied VM_READ + QUERY_LIMITED on ' +
+              'default-DACL real-user process (logon-SID stripped)')
+} finally {
+  try { $victim.Kill() } catch { }
+}
+
+# ── R12: child is on the broker-created srt-sb-* desktop ─────────
+# The broker creates `WinSta0\srt-sb-<pid>-<rand>` and passes it via
+# CreateProcessWithLogonW's lpDesktop; the runner attaches there and
+# the lockdown child inherits. If the child reports `Default`, the
+# fail-closed assertion in run_lockdown was bypassed and the child
+# can WH_KEYBOARD_LL-hook the interactive desktop (the Job's UI
+# limits do NOT gate low-level hooks). The child's own
+# GetThreadDesktop name is the substantive check (the runner's
+# `caller_desk=` debug line is gated on SANDBOX_RUNTIME_WIN_DEBUG
+# in the RUNNER's env, which isn't in the --env overlay).
+$probeR12 = @"
+`$sig = @'
+[DllImport("user32.dll")]public static extern System.IntPtr GetThreadDesktop(uint t);
+[DllImport("kernel32.dll")]public static extern uint GetCurrentThreadId();
+[DllImport("user32.dll",CharSet=CharSet.Unicode)]public static extern bool GetUserObjectInformationW(System.IntPtr h,int i,System.Text.StringBuilder b,uint n,out uint r);
+'@
+`$u = Add-Type -MemberDefinition `$sig -Name U32D -Namespace W -PassThru
+`$d = `$u::GetThreadDesktop(`$u::GetCurrentThreadId())
+`$sb = [System.Text.StringBuilder]::new(256); `$r = 0
+[void]`$u::GetUserObjectInformationW(`$d, 2, `$sb, 512, [ref]`$r)
+"CHILD_DESK=" + `$sb.ToString()
+"@
+$r = RExec @('--', $pwsh, '-NoProfile', '-Command', $probeR12)
+Write-Host "R12 probe output: $($r.out.Trim())"
+if ($r.out -notmatch 'CHILD_DESK=srt-sb-') {
+  throw "R12: child not on srt-sb-* desktop — desktop isolation " +
+        "broken (WH_KEYBOARD_LL keylogging risk). raw: $($r.raw)"
+}
+if ($r.out -match 'CHILD_DESK=Default') {
+  throw "R12: child on Default desktop. raw: $($r.raw)"
+}
+Write-Host 'R12 ok: child on broker-created srt-sb-* desktop (not Default)'
 
 # ── R6: child cannot read state.db (sandbox-runtime-users DENY) ──
 $stateDb = Join-Path $env:LOCALAPPDATA 'sandbox-runtime\state.db'
@@ -898,8 +985,7 @@ try {
 # refuses with the dedicated exit code instead of failing the
 # logon. Re-install afterward is unnecessary — teardown follows.
 Run @('uninstall','--sublayer-guid',$Sublayer)
-$r = & $Exe exec --group-sid $GroupSid `
-        --as-sandbox-user -- $cmd /c 'exit 0' 2>&1 | Out-String
+$r = & $Exe exec --as-sandbox-user -- $cmd /c 'exit 0' 2>&1 | Out-String
 if ($LASTEXITCODE -ne 15) {
   throw "R8: expected exit 15 (not provisioned), got ${LASTEXITCODE}. out: $r"
 }
@@ -917,4 +1003,4 @@ $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
-Write-Host 'smoke-exec: PASS (E1-E11c incl. E4b/E7b/E7c, R1-R6/R8/R9/R9b incl. R5b, G1-G6)'
+Write-Host 'smoke-exec: PASS (E1-E11c incl. E4b/E7b/E7c, R1-R6/R8/R9/R9b/R12 incl. R5b, G1-G6)'

@@ -44,7 +44,7 @@ use windows::Win32::Security::{
     ACL, ACL_REVISION, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
     DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
     OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
     UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
@@ -161,12 +161,9 @@ impl Allow<'static> {
 /// Self-owning ACL: `buf` holds the `ACL` header + ACEs.
 /// `AddAccessAllowedAceEx` copies SID bytes inline into each ACE
 /// (`SidStart` embeds the SID — see the size calc in
-/// [`build_allow_dacl`]), so once built `buf` is self-contained.
+/// [`rebuild_acl`]), so once built `buf` is self-contained.
 pub struct BuiltAcl {
     buf: Vec<u8>,
-    /// Retained for Drop ordering only — SID bytes are already
-    /// inline in `buf`, so this is belt-and-braces.
-    _marker: Option<LocalPsid>,
 }
 
 impl BuiltAcl {
@@ -270,46 +267,21 @@ impl ParsedAces {
             .map(|h| LocalPsid::from_string(&marker_sid_string(h)))
             .transpose()
             .context("parse marker SID")?;
-
-        // ACL header + Σ ACE size. `ACE_FIXED` (8) + GetLengthSid
-        // per ACE (`SidStart` embeds the SID).
-        let mut total = size_of::<ACL>();
-        for (s, _, _) in &self.rows {
-            total +=
-                ACE_FIXED + unsafe { GetLengthSid(s.as_psid()) } as usize;
-        }
-        if let Some(m) = &marker_sid {
-            total +=
-                ACE_FIXED + unsafe { GetLengthSid(m.as_psid()) } as usize;
-        }
-        total = (total + 3) & !3; // DWORD-align
-
-        let mut buf = vec![0u8; total];
-        let acl = buf.as_mut_ptr() as *mut ACL;
-        unsafe {
-            InitializeAcl(acl, total as u32, ACL_REVISION)
-                .context("InitializeAcl")?;
-            for (s, m, fl) in &self.rows {
-                AddAccessAllowedAceEx(
-                    acl, ACL_REVISION, *fl, m.bits(), s.as_psid(),
-                )
-                .with_context(|| {
-                    format!("AddAccessAllowedAceEx({:#x})", m.bits())
-                })?;
-            }
-            if let Some(m) = &marker_sid {
-                // READ_CONTROL not 0; NO_INHERIT — see hash-ACE note.
-                AddAccessDeniedAceEx(
-                    acl,
-                    ACL_REVISION,
-                    NO_INHERIT,
-                    Mask::READ_CONTROL.bits(),
-                    m.as_psid(),
-                )
-                .context("AddAccessDeniedAceEx(marker)")?;
-            }
-        }
-        Ok(BuiltAcl { buf, _marker: marker_sid })
+        let head: Vec<NewAce> = self
+            .rows
+            .iter()
+            .map(|(s, m, fl)| NewAce::Allow(s.as_psid(), m.bits(), *fl))
+            .collect();
+        // READ_CONTROL not 0; NO_INHERIT — see hash-ACE note.
+        let tail: Vec<NewAce> = marker_sid
+            .iter()
+            .map(|m| {
+                NewAce::Deny(m.as_psid(), Mask::READ_CONTROL.bits(), NO_INHERIT)
+            })
+            .collect();
+        rebuild_acl(ACL_REVISION, &head, &KeptAces::EMPTY, &tail)
+        // `marker_sid` (and `self.rows`' LocalPsids) drop here; the
+        // SID bytes are already inline in the returned ACL buffer.
     }
 }
 
@@ -345,6 +317,72 @@ const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 /// Fixed prefix of `ACCESS_ALLOWED_ACE` / `ACCESS_DENIED_ACE`
 /// (Header 4 + Mask 4); `SidStart` is the first DWORD of the SID.
 const ACE_FIXED: usize = 8;
+
+/// `n` rounded up to a DWORD boundary — `InitializeAcl` requires the
+/// ACL buffer length to be DWORD-aligned.
+const fn dword_align(n: usize) -> usize {
+    (n + 3) & !3
+}
+
+/// One ACE to add at the head/tail of a [`rebuild_acl`] output.
+/// `PSID` borrows the caller's SID buffer; keep it alive across the
+/// call.
+pub(crate) enum NewAce {
+    Allow(PSID, u32, ACE_FLAGS),
+    Deny(PSID, u32, ACE_FLAGS),
+}
+
+impl NewAce {
+    fn sid(&self) -> PSID {
+        let (Self::Allow(s, ..) | Self::Deny(s, ..)) = self;
+        *s
+    }
+}
+
+/// Size + `InitializeAcl(rev)` + `head` ACEs + `kept` raw ACEs +
+/// `tail` ACEs → [`BuiltAcl`]. The single ACL-construction
+/// chokepoint: [`ParsedAces::build_with_marker`] (head + marker
+/// tail, `rev = ACL_REVISION`), [`apply_sandbox_aces`] (head + kept,
+/// `rev` from the source ACL via [`filter_aces`]),
+/// [`build_explicit_only_acl`] (kept only), and
+/// `winsta::recompose_dacl` (kept + tail) all thread through here.
+///
+/// `rev` MUST match the kept ACEs' source revision when `kept` is
+/// non-empty (`AddAce` requires `ACL_REVISION_DS` when copying
+/// object-type ACEs); pass [`KeptAces::src_rev`].
+pub(crate) fn rebuild_acl(
+    rev: ACE_REVISION,
+    head: &[NewAce],
+    kept: &KeptAces,
+    tail: &[NewAce],
+) -> Result<BuiltAcl> {
+    let mut total = size_of::<ACL>() + kept.total_sz;
+    for a in head.iter().chain(tail) {
+        total += ACE_FIXED + unsafe { GetLengthSid(a.sid()) } as usize;
+    }
+    total = dword_align(total);
+    let mut buf = vec![0u8; total];
+    let acl = buf.as_mut_ptr() as *mut ACL;
+    unsafe { InitializeAcl(acl, total as u32, rev) }
+        .context("InitializeAcl")?;
+    let add = |a: &NewAce| match *a {
+        NewAce::Allow(s, m, f) => unsafe {
+            AddAccessAllowedAceEx(acl, rev, f, m, s)
+        }
+        .with_context(|| format!("AddAccessAllowedAceEx({m:#x})")),
+        NewAce::Deny(s, m, f) => unsafe {
+            AddAccessDeniedAceEx(acl, rev, f, m, s)
+        }
+        .with_context(|| format!("AddAccessDeniedAceEx({m:#x})")),
+    };
+    head.iter().try_for_each(&add)?;
+    for (ace, sz) in &kept.aces {
+        unsafe { AddAce(acl, rev, u32::MAX, *ace, *sz as u32) }
+            .context("AddAce(keep)")?;
+    }
+    tail.iter().try_for_each(&add)?;
+    Ok(BuiltAcl { buf })
+}
 
 /// `h` → string SID `S-1-0-h0-h1-…-h7` (Null SID Authority, 8
 /// sub-authorities = 8×u32 LE = 256 bits). Round-trips through
@@ -577,8 +615,21 @@ pub(crate) fn read_file_dacl(
     Ok((OwnedSd::from_raw(psd), dacl))
 }
 
-/// `(kept ACE ptrs+sizes, Σ kept sizes, source AclRevision)`.
-pub(crate) type KeptAces = (Vec<(*const c_void, u16)>, usize, ACE_REVISION);
+/// Kept ACE pointers from a [`filter_aces`] walk, plus their
+/// summed size and the source ACL's revision (so a [`rebuild_acl`]
+/// caller can preserve `ACL_REVISION_DS` for object-type ACEs).
+pub(crate) struct KeptAces {
+    pub(crate) aces: Vec<(*const c_void, u16)>,
+    pub(crate) total_sz: usize,
+    pub(crate) src_rev: ACE_REVISION,
+}
+
+impl KeptAces {
+    /// No kept ACEs; `src_rev = ACL_REVISION` (the no-object-ACE
+    /// default).
+    pub(crate) const EMPTY: Self =
+        Self { aces: Vec::new(), total_sz: 0, src_rev: ACL_REVISION };
+}
 
 /// Walk every ACE of `acl` and collect `(ptr, AceSize)` for those
 /// `keep` accepts. Returns `(kept, Σ kept sizes, source AclRevision)`.
@@ -599,7 +650,7 @@ pub(crate) fn filter_aces(
     mut keep: impl FnMut(&ACE_HEADER, &[u8]) -> bool,
 ) -> Result<KeptAces> {
     if acl.is_null() {
-        return Ok((Vec::new(), 0, ACL_REVISION));
+        return Ok(KeptAces::EMPTY);
     }
     let src_rev = ACE_REVISION(unsafe { (*acl).AclRevision } as u32);
     let mut info = ACL_SIZE_INFORMATION::default();
@@ -612,8 +663,7 @@ pub(crate) fn filter_aces(
         )
         .context("GetAclInformation")?;
     }
-    let mut kept: Vec<(*const c_void, u16)> = Vec::new();
-    let mut kept_sz = 0usize;
+    let mut kept = KeptAces { aces: Vec::new(), total_sz: 0, src_rev };
     for i in 0..info.AceCount {
         let mut ace: *mut c_void = std::ptr::null_mut();
         unsafe { GetAce(acl, i, &mut ace) }
@@ -626,11 +676,11 @@ pub(crate) fn filter_aces(
             std::slice::from_raw_parts(ace as *const u8, hdr.AceSize as usize)
         };
         if keep(hdr, body) {
-            kept.push((ace as *const c_void, hdr.AceSize));
-            kept_sz += hdr.AceSize as usize;
+            kept.aces.push((ace as *const c_void, hdr.AceSize));
+            kept.total_sz += hdr.AceSize as usize;
         }
     }
-    Ok((kept, kept_sz, src_rev))
+    Ok(kept)
 }
 
 /// True iff `body[ACE_FIXED..]` starts with exactly `sid_bytes` —
@@ -1318,6 +1368,24 @@ pub struct SbAceSet {
     pub deny_fdc: bool,
 }
 
+impl SbAceSet {
+    /// The set's entries as [`NewAce`]s for `sid`, in canonical
+    /// deny → deny-fdc → allow order. All carry [`OICI`].
+    fn head_aces(&self, sid: PSID) -> Vec<NewAce> {
+        let mut v = Vec::with_capacity(3);
+        if let Some(m) = self.deny {
+            v.push(NewAce::Deny(sid, m.bits(), OICI));
+        }
+        if self.deny_fdc {
+            v.push(NewAce::Deny(sid, Mask::FILE_DELETE_CHILD.bits(), OICI));
+        }
+        if let Some(m) = self.grant {
+            v.push(NewAce::Allow(sid, m.bits(), OICI));
+        }
+        v
+    }
+}
+
 /// Converge `canonical_path`'s explicit ACEs for `sandbox_sid` to
 /// exactly `set`. Idempotent — every existing explicit ACE for the
 /// SID (allow AND deny) is dropped, then `set`'s entries are
@@ -1342,58 +1410,21 @@ pub fn apply_sandbox_aces(
     let sid = LocalPsid::from_string(sandbox_sid)
         .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
     let sid_bytes = sid.as_bytes();
-    // 1. Read the current DACL. `_sd` owns the buffer `old`/`keep`
+    // 1. Read the current DACL. `_sd` owns the buffer `old`/`kept`
     //    point into; it's freed after step 4's write.
     let (_sd, old) = read_file_dacl(canonical_path)
         .with_context(|| format!("recompose '{canonical_path}'"))?;
     // 2. Collect surviving explicit ACEs (drop inherited and any
     //    explicit ACE whose SID == sandbox_sid — allow AND deny).
-    let (keep, keep_sz, src_rev) = filter_aces(old, |hdr, body| {
+    let kept = filter_aces(old, |hdr, body| {
         hdr.AceFlags & INHERITED_ACE == 0 && !ace_sid_is(body, sid_bytes)
     })?;
     // 3. Build fresh ACL: set's entries (deny-first canonical order)
     //    then surviving explicit ACEs.
-    let new_ace_sz = ACE_FIXED + sid_bytes.len();
-    let n_new = set.deny.is_some() as usize
-        + set.deny_fdc as usize
-        + set.grant.is_some() as usize;
-    let mut total = size_of::<ACL>() + keep_sz + n_new * new_ace_sz;
-    total = (total + 3) & !3;
-    let mut buf = vec![0u8; total];
-    let acl = buf.as_mut_ptr() as *mut ACL;
-    unsafe {
-        InitializeAcl(acl, total as u32, src_rev)
-            .context("InitializeAcl(recompose)")?;
-        if let Some(m) = set.deny {
-            AddAccessDeniedAceEx(
-                acl, src_rev, OICI, m.bits(), sid.as_psid(),
-            )
-            .context("AddAccessDeniedAceEx(deny)")?;
-        }
-        if set.deny_fdc {
-            AddAccessDeniedAceEx(
-                acl,
-                src_rev,
-                OICI,
-                Mask::FILE_DELETE_CHILD.bits(),
-                sid.as_psid(),
-            )
-            .context("AddAccessDeniedAceEx(deny-fdc)")?;
-        }
-        if let Some(m) = set.grant {
-            AddAccessAllowedAceEx(
-                acl, src_rev, OICI, m.bits(), sid.as_psid(),
-            )
-            .context("AddAccessAllowedAceEx(grant)")?;
-        }
-        for (ace, sz) in &keep {
-            AddAce(acl, src_rev, u32::MAX, *ace, *sz as u32)
-                .context("AddAce(keep)")?;
-        }
-    }
+    let new = rebuild_acl(kept.src_rev, &set.head_aces(sid.as_psid()), &kept, &[])?;
     // 4. Write back. UNPROTECTED so the kernel re-derives inherited
     //    ACEs from the parent.
-    write_file_dacl(canonical_path, acl, Protection::Unprotected)
+    write_file_dacl(canonical_path, new.as_ptr(), Protection::Unprotected)
         .with_context(|| format!("recompose '{canonical_path}'"))
 }
 
@@ -1432,21 +1463,9 @@ const INHERITED_ACE: u8 = 0x10;
 /// inherited ACEs. If `src` is purely inherited the result is an
 /// empty ACL ("no explicit DACL").
 unsafe fn build_explicit_only_acl(src: *mut ACL) -> Result<Vec<u8>> {
-    let (explicit, keep_sz, src_rev) =
+    let kept =
         filter_aces(src, |hdr, _| hdr.AceFlags & INHERITED_ACE == 0)?;
-    let total = ((size_of::<ACL>() + keep_sz) + 3) & !3; // DWORD-align
-    let mut buf = vec![0u8; total];
-    let acl = buf.as_mut_ptr() as *mut ACL;
-    unsafe {
-        InitializeAcl(acl, total as u32, src_rev)
-            .context("InitializeAcl(explicit-only)")?;
-        for (ace, sz) in explicit {
-            // u32::MAX appends; copy the raw ACE bytes verbatim.
-            AddAce(acl, src_rev, u32::MAX, ace, sz as u32)
-                .context("AddAce(explicit)")?;
-        }
-    }
-    Ok(buf)
+    Ok(rebuild_acl(kept.src_rev, &[], &kept, &[])?.buf)
 }
 
 #[cfg(test)]
@@ -1579,6 +1598,28 @@ mod tests {
             classify_sd(&sd_of(&other, PROT), &calib).unwrap(),
             StampClass::Unstamped
         );
+    }
+
+    /// IsolatedDesk's `[broker, sb, SY]:GA` DACL — 3 ACEs,
+    /// revision 2, GENERIC_ALL on each. Regression for the
+    /// `KeptAces`/`rebuild_acl` chokepoint: a sizing or revision
+    /// bug here breaks the SandboxUser desktop attach (R1 hang).
+    #[test]
+    fn isolated_desk_dacl_shape() {
+        let d = build_allow_dacl(&[
+            Allow("S-1-5-21-1-2-3-1000", Mask::GENERIC_ALL, NO_INHERIT),
+            Allow("S-1-5-21-1-2-3-1004", Mask::GENERIC_ALL, NO_INHERIT),
+            Allow(SID_SYSTEM,            Mask::GENERIC_ALL, NO_INHERIT),
+        ])
+        .unwrap();
+        assert_eq!(d.buf[0], 2, "AclRevision");
+        assert_eq!(ace_count(&d), 3);
+        let aces = walk_aces(d.as_ptr()).unwrap();
+        for a in &aces {
+            assert_eq!(a.ace_type, 0, "ACCESS_ALLOWED_ACE_TYPE");
+            assert_eq!(a.mask, Mask::GENERIC_ALL.bits());
+            assert_eq!(a.ace_flags, 0);
+        }
     }
 
     #[test]
