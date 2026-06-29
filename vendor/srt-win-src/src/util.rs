@@ -71,7 +71,20 @@ pub fn local_free(p: *mut c_void) {
     }
 }
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
+use windows::Win32::Foundation::WIN32_ERROR;
+
+/// `Ok(())` if `r` is `ERROR_SUCCESS`, else `bail!("{label}:
+/// WIN32_ERROR=0x…")`. For Win32 APIs that return a bare
+/// `WIN32_ERROR` rather than a `windows::core::Result` (e.g.
+/// `Get`/`SetNamedSecurityInfoW`).
+pub(crate) fn win32_ok(r: WIN32_ERROR, label: &str) -> Result<()> {
+    if r.is_err() {
+        bail!("{label}: WIN32_ERROR=0x{:08x}", r.0)
+    }
+    Ok(())
+}
+
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, KEY_SET_VALUE,
     REG_OPTION_NON_VOLATILE, REG_VALUE_TYPE,

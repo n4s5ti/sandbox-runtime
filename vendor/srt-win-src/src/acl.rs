@@ -55,7 +55,7 @@ use windows::Win32::Storage::FileSystem::{
 
 use crate::path_id::FileId;
 use crate::sid::LocalPsid;
-use crate::util::{local_free, pcwstr, wstr, OwnedSd};
+use crate::util::{local_free, pcwstr, win32_ok, wstr, OwnedSd};
 
 /// Owner-Rights well-known SID. ANY ACE for this SID replaces
 /// the kernel's implicit `READ_CONTROL|WRITE_DAC` grant to the
@@ -380,27 +380,45 @@ pub fn set_file_dacl_protected(
     dacl: &BuiltAcl,
     label: &str,
 ) -> Result<()> {
-    let w = wstr(canonical_path);
+    write_file_dacl(canonical_path, dacl.as_ptr(), Protection::Protected)
+        .context(label.to_owned())
+}
+
+/// Whether [`write_file_dacl`] sets `PROTECTED_` (block inheritance
+/// from the parent — used for the broker-only allow-list stamp and
+/// state-DB dir) or `UNPROTECTED_DACL_SECURITY_INFORMATION`
+/// (re-derive inherited ACEs from the parent — used by
+/// [`apply_sandbox_aces`]).
+pub(crate) enum Protection {
+    Protected,
+    Unprotected,
+}
+
+/// Write `acl` as `path`'s DACL via
+/// `SetNamedSecurityInfoW(SE_FILE_OBJECT, DACL | <p>)`. Mirror of
+/// [`read_file_dacl`].
+pub(crate) fn write_file_dacl(
+    path: &str,
+    acl: *const ACL,
+    p: Protection,
+) -> Result<()> {
+    let prot = match p {
+        Protection::Protected => PROTECTED_DACL_SECURITY_INFORMATION,
+        Protection::Unprotected => UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let w = wstr(path);
     let r = unsafe {
         SetNamedSecurityInfoW(
             pcwstr(&w),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | prot,
             None,
             None,
-            Some(dacl.as_ptr()),
+            Some(acl),
             None,
         )
     };
-    if r.is_err() {
-        bail!(
-            "SetNamedSecurityInfoW({label} '{canonical_path}'): \
-             WIN32_ERROR=0x{:08x}",
-            r.0
-        );
-    }
-    Ok(())
+    win32_ok(r, &format!("SetNamedSecurityInfoW('{path}')"))
 }
 
 /// Stamp shape. `ReadDeny` makes the file broker-only for ALL
@@ -543,8 +561,8 @@ pub(crate) fn read_file_dacl(
     let w = wstr(canonical_path);
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut psd = PSECURITY_DESCRIPTOR::default();
-    unsafe {
-        let r = GetNamedSecurityInfoW(
+    let r = unsafe {
+        GetNamedSecurityInfoW(
             pcwstr(&w),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
@@ -553,15 +571,9 @@ pub(crate) fn read_file_dacl(
             Some(&mut dacl),
             None,
             &mut psd,
-        );
-        if r.is_err() {
-            bail!(
-                "GetNamedSecurityInfoW('{canonical_path}'): \
-                 WIN32_ERROR=0x{:08x}",
-                r.0
-            );
-        }
-    }
+        )
+    };
+    win32_ok(r, &format!("GetNamedSecurityInfoW('{canonical_path}')"))?;
     Ok((OwnedSd::from_raw(psd), dacl))
 }
 
@@ -882,8 +894,8 @@ pub fn capture_sd(canonical_path: &str) -> Result<CapturedSd> {
         | OWNER_SECURITY_INFORMATION
         | GROUP_SECURITY_INFORMATION;
     let mut psd = PSECURITY_DESCRIPTOR::default();
-    unsafe {
-        let r = GetNamedSecurityInfoW(
+    let r = unsafe {
+        GetNamedSecurityInfoW(
             pcwstr(&w),
             SE_FILE_OBJECT,
             info,
@@ -892,14 +904,9 @@ pub fn capture_sd(canonical_path: &str) -> Result<CapturedSd> {
             None,
             None,
             &mut psd,
-        );
-        if r.is_err() {
-            bail!(
-                "GetNamedSecurityInfoW('{canonical_path}'): WIN32_ERROR=0x{:08x}",
-                r.0
-            );
-        }
-    }
+        )
+    };
+    win32_ok(r, &format!("GetNamedSecurityInfoW('{canonical_path}')"))?;
     // The returned SD is documented self-relative; copy it out so we
     // own the bytes.
     let len = unsafe { GetSecurityDescriptorLength(psd) } as usize;
@@ -1004,13 +1011,10 @@ pub fn restore_sd(canonical_path: &str, sd: &CapturedSd) -> Result<()> {
             dacl_arg,
             None,
         );
-        if r.is_err() {
-            bail!(
-                "SetNamedSecurityInfoW(restore '{canonical_path}'): \
-                 WIN32_ERROR=0x{:08x}",
-                r.0
-            );
-        }
+        win32_ok(
+            r,
+            &format!("SetNamedSecurityInfoW(restore '{canonical_path}')"),
+        )?;
     }
     Ok(())
 }
@@ -1175,27 +1179,8 @@ pub fn set_path_dacl_from_sddl(
     if !present.as_bool() || dacl.is_null() {
         bail!("{label}: SDDL '{sddl}' yielded no DACL");
     }
-    let w = wstr(path);
-    let r = unsafe {
-        SetNamedSecurityInfoW(
-            pcwstr(&w),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(dacl),
-            None,
-        )
-    };
-    if r.is_err() {
-        bail!(
-            "SetNamedSecurityInfoW({label} '{path}'): \
-             WIN32_ERROR=0x{:08x}",
-            r.0
-        );
-    }
-    Ok(())
+    write_file_dacl(path, dacl, Protection::Protected)
+        .context(label.to_owned())
 }
 
 // ─── Additive grants (working-tree access for the sandbox user) ─────
@@ -1405,28 +1390,11 @@ pub fn apply_sandbox_aces(
             AddAce(acl, src_rev, u32::MAX, *ace, *sz as u32)
                 .context("AddAce(keep)")?;
         }
-        // 4. Write back. UNPROTECTED so the kernel re-derives
-        //    inherited ACEs from the parent.
-        let w = wstr(canonical_path);
-        let r = SetNamedSecurityInfoW(
-            pcwstr(&w),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION
-                | UNPROTECTED_DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(acl),
-            None,
-        );
-        if r.is_err() {
-            bail!(
-                "SetNamedSecurityInfoW(recompose '{canonical_path}'): \
-                 WIN32_ERROR=0x{:08x}",
-                r.0
-            );
-        }
     }
-    Ok(())
+    // 4. Write back. UNPROTECTED so the kernel re-derives inherited
+    //    ACEs from the parent.
+    write_file_dacl(canonical_path, acl, Protection::Unprotected)
+        .with_context(|| format!("recompose '{canonical_path}'"))
 }
 
 /// Build + apply the parent allow-list (DACL+marker, `PROTECTED`).
