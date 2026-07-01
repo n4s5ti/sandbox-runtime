@@ -186,9 +186,9 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  * sentinels — the rest of the file is preserved byte-for-byte. This lets a
  * tool that parses the file (`.netrc`, JSON/YAML configs) still succeed
  * inside the sandbox while the credential values are protected. If the
- * regex matches nothing, a warning is emitted to stderr and the file is
- * left readable as-is (unprotected) — fix the regex or remove the entry.
- * A future option may make this behaviour configurable.
+ * pattern matches nothing, behaviour is governed by `onExtractNoMatch`
+ * (default `"warn"` — the file is left readable as-is and a stderr
+ * warning is emitted).
  *
  * On macOS, SBPL cannot redirect reads, so `mode: "mask"` (with or without
  * `extract`) currently degrades to `mode: "deny"` (the file is unreadable
@@ -205,10 +205,36 @@ export const CredentialFileConfigSchema = z.object({
     .describe(
       'Optional regex for structured masking. Applied globally; capture ' +
         'group 1 of each match is masked, the rest of the file is preserved. ' +
-        'If the pattern matches nothing in the file, a warning is emitted ' +
-        'and the file is left readable as-is (unprotected) — fix the regex ' +
-        'or remove the entry. A future option may make this configurable. ' +
-        'Only meaningful when mode is "mask"; accepted but ignored for "deny".',
+        'If the pattern matches nothing, behaviour is governed by ' +
+        'onExtractNoMatch (default "warn"). Only meaningful when mode is ' +
+        '"mask"; accepted but ignored for "deny".',
+    ),
+  /**
+   * What to do when `extract` matches nothing in the file at runtime.
+   *
+   * - `"warn"` (default): emit a stderr warning and leave the file
+   *   readable as-is inside the sandbox (fail-open). A non-matching
+   *   pattern is treated as a config error to surface and fix, not a
+   *   reason to break a tool that needs the file when the credential is
+   *   legitimately absent.
+   * - `"deny"`: degrade the entry to `mode: "deny"` so the file is
+   *   unreadable inside the sandbox (fail-closed). The operator declared
+   *   this file as containing a credential; if the regex cannot find it,
+   *   block access rather than expose it.
+   * - `"error"`: throw at wrap time so nothing runs until the operator
+   *   fixes the regex.
+   *
+   * Only meaningful when `mode` is `"mask"` and `extract` is set;
+   * accepted but ignored otherwise.
+   */
+  onExtractNoMatch: z
+    .enum(['warn', 'deny', 'error'])
+    .optional()
+    .describe(
+      'What to do when extract matches nothing: "warn" (default — stderr ' +
+        'warning, file left readable), "deny" (degrade to mode "deny" — ' +
+        'file unreadable), or "error" (throw at wrap time). Only meaningful ' +
+        'with mode "mask" and extract set.',
     ),
   injectHosts: z
     .array(domainPatternSchema)
