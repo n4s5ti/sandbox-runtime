@@ -198,6 +198,40 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
     expect(bad).toContain(`deny openat ${allow}/../ro/rel-bad.txt`)
   })
 
+  it('does not hang when the listener stops reading (full pipe drops)', () => {
+    // The event pipe is a bounded queue; a stalled consumer must cost
+    // log lines, never workload time. 3000 writes far exceeds the pipe
+    // capacity — pre-fix this froze at the first full-pipe write.
+    const stall = startLinuxSandboxViolationMonitor(() => {}, {
+      allowWritePaths: ['/'],
+      denyWritePaths: [],
+    })
+    return stall.ready.then(() => {
+      const dir = mkdtempSync(join(tmpdir(), 'srt-vmon-stall-'))
+      try {
+        const t0 = Date.now()
+        const r = spawnSync(
+          applyPath!,
+          [
+            '/bin/sh',
+            '-c',
+            `cd ${dir} && i=0; while [ $i -lt 3000 ]; do echo x > f$i; i=$((i+1)); done && echo DONE`,
+          ],
+          {
+            env: { ...process.env, SRT_OBSERVE_SOCK: stall.observeSocketPath! },
+            timeout: 20_000,
+          },
+        )
+        expect(r.status).toBe(0)
+        expect(String(r.stdout)).toContain('DONE')
+        expect(Date.now() - t0).toBeLessThan(15_000)
+      } finally {
+        stall.stop()
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  }, 30_000)
+
   it('does not hang when the listener is unreachable', () => {
     const t0 = Date.now()
     const r = spawnSync(

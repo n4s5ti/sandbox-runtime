@@ -92,7 +92,7 @@
 /* ---- Optional passive observation filter ---------------------------------
  *
  * When SRT_OBSERVE_SOCK is set the worker installs a second seccomp filter
- * that traps write-intent filesystem syscalls (and connect) to
+ * that traps write-intent filesystem syscalls to
  * SECCOMP_RET_USER_NOTIF, then ships the listener fd to the OUTER STUB over
  * a pre-fork socketpair. The outer stub is never under either filter, so it
  * services every notification with SECCOMP_USER_NOTIF_FLAG_CONTINUE — the
@@ -141,8 +141,7 @@
 /* Single source of truth for the observed-syscall set. The BPF program and
  * the supervisor's name/path-arg lookup are both derived from this table so
  * they cannot drift. flags_arg >= 0 means the BPF gates the trap on
- * args[flags_arg] & OBS_WRITE_MASK; -1 means always trap. path_arg == -2
- * marks connect(2), which reads a sockaddr instead of a path. */
+ * args[flags_arg] & OBS_WRITE_MASK; -1 means always trap. */
 struct observe_call {
     int nr;
     const char *name;
@@ -173,7 +172,6 @@ static const struct observe_call observe_calls[] = {
     { __NR_fchmodat2,  "fchmodat2",  1, -1, -1,  0, -1 },
     { __NR_fchownat,   "fchownat",   1, -1, -1,  0, -1 },
     { __NR_utimensat,  "utimensat",  1, -1, -1,  0, -1 },
-    { __NR_connect,    "connect",   -2, -1, -1, -1, -1 },
 #ifdef __x86_64__
     /* Legacy non-*at entry points: glibc/coreutils still call these directly
      * on x86_64. aarch64 only ever had the *at forms. */
@@ -317,7 +315,7 @@ static int recv_fd(int sock) {
  *
  * Audited syscalls between the seccomp() return and execve():
  *   sendmsg, close, close, prctl(PR_SET_SECCOMP), execve
- * None are in the observe match set (write-intent fs / connect) and none are
+ * None are in the observe match set (write-intent fs) and none are
  * in the unix-block set (socket(AF_UNIX)/io_uring), so the worker cannot
  * trap on itself before exec. perror()/snprintf() are deliberately avoided
  * post-filter to keep this set closed. */
@@ -459,7 +457,14 @@ static void emit_event(int out, const struct observe_call *oc, int nr, pid_t pid
                      "{\"nr\":%d,\"syscall\":\"%s\",\"pid\":%d,\"path\":\"%s\"}\n",
                      nr, oc ? oc->name : "syscall", (int)pid, esc);
     }
-    if (n > 0) (void)!write(out, line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line)-1));
+    /* Never wait on the consumer: the pipe is a bounded queue and this
+     * channel is best-effort — full pipe drops the note (a short write
+     * corrupts at most one line, which the listener already ignores). */
+    if (n > 0) {
+        (void)!send(out, line,
+                    (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line)-1),
+                    MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
 }
 
 static int connect_observe_sock(const char *path) {
@@ -490,8 +495,9 @@ static void supervise(pid_t child, int notify_fd, int out_sock,
     struct seccomp_notif *req = calloc(1, sz.seccomp_notif);
     struct seccomp_notif_resp *resp = calloc(1, sz.seccomp_notif_resp);
     char *pbuf = malloc(OBS_PATH_MAX);
-    char *jbuf = malloc(OBS_PATH_MAX * 2);
-    if (!req || !resp || !pbuf || !jbuf) return;
+    char *fbuf1 = malloc(OBS_PATH_MAX * 2);
+    char *fbuf2 = malloc(OBS_PATH_MAX * 2);
+    if (!req || !resp || !pbuf || !fbuf1 || !fbuf2) return;
 
     int pidfd = (int)syscall(__NR_pidfd_open, child, 0);
 
@@ -509,54 +515,44 @@ static void supervise(pid_t child, int notify_fd, int out_sock,
             memset(req, 0, sz.seccomp_notif);
             if (ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_RECV, req) == 0) {
                 const struct observe_call *oc = find_observe_call(req->data.nr);
-                if (out_sock >= 0 &&
+                /* Capture while the caller is frozen (its memory, cwd and
+                 * dirfds are stable), but EMIT only after the reply: the
+                 * workload's pause must contain no work besides this
+                 * capture — never a pipe write. */
+                size_t flen[2] = { 0, 0 };
+                if (oc && out_sock >= 0 &&
                     ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &req->id) == 0) {
-                    if (oc && oc->path_arg == -2) {
-                        struct sockaddr_un su;
-                        ssize_t rl = read_remote_bytes(req->pid,
-                                       (unsigned long)req->data.args[1],
-                                       (char *)&su, sizeof(su));
-                        if (rl >= (ssize_t)offsetof(struct sockaddr_un, sun_path) + 1 &&
-                            su.sun_family == AF_UNIX) {
-                            size_t cap = (size_t)rl - offsetof(struct sockaddr_un, sun_path);
-                            if (cap > sizeof(su.sun_path)) cap = sizeof(su.sun_path);
-                            size_t l = strnlen(su.sun_path, cap);
-                            emit_event(out_sock, oc, req->data.nr, req->pid,
-                                       su.sun_path, l, enc);
+                    int idxs[2]   = { oc->path_arg,  oc->path2_arg  };
+                    int dirfds[2] = { oc->dirfd_arg, oc->dirfd2_arg };
+                    for (int k = 0; k < 2; k++) {
+                        if (idxs[k] < 0) continue;
+                        char *out = k == 0 ? fbuf1 : fbuf2;
+                        ssize_t l = read_remote_cstr(req->pid,
+                                      (unsigned long)req->data.args[idxs[k]],
+                                      pbuf, OBS_PATH_MAX);
+                        if (l <= 0) continue;
+                        if (pbuf[0] == '/') {
+                            memcpy(out, pbuf, (size_t)l);
+                            flen[k] = (size_t)l;
+                            continue;
                         }
-                    } else if (oc) {
-                        int idxs[2]   = { oc->path_arg,  oc->path2_arg  };
-                        int dirfds[2] = { oc->dirfd_arg, oc->dirfd2_arg };
-                        for (int k = 0; k < 2; k++) {
-                            if (idxs[k] < 0) continue;
-                            ssize_t l = read_remote_cstr(req->pid,
-                                          (unsigned long)req->data.args[idxs[k]],
-                                          pbuf, OBS_PATH_MAX);
-                            if (l <= 0) continue;
-                            if (pbuf[0] == '/') {
-                                emit_event(out_sock, oc, req->data.nr,
-                                           req->pid, pbuf, (size_t)l, enc);
-                                continue;
-                            }
-                            /* Relative: resolve against the tracee's cwd or
-                             * dirfd. Unresolvable → skip (best effort). */
-                            size_t jl = resolve_relative(host_proc_fd,
-                                          req->pid, req, dirfds[k],
-                                          pbuf, (size_t)l,
-                                          jbuf, OBS_PATH_MAX * 2);
-                            if (jl > 0 &&
-                                ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ID_VALID,
-                                      &req->id) == 0) {
-                                emit_event(out_sock, oc, req->data.nr,
-                                           req->pid, jbuf, jl, enc);
-                            }
-                        }
+                        /* Relative: resolve against the tracee's cwd or
+                         * dirfd. Unresolvable → skip (best effort). */
+                        flen[k] = resolve_relative(host_proc_fd,
+                                     req->pid, req, dirfds[k],
+                                     pbuf, (size_t)l, out, OBS_PATH_MAX * 2);
                     }
                 }
                 memset(resp, 0, sz.seccomp_notif_resp);
                 resp->id = req->id;
                 resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
                 (void)ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, resp);
+                for (int k = 0; k < 2; k++) {
+                    if (flen[k] > 0) {
+                        emit_event(out_sock, oc, req->data.nr, req->pid,
+                                   k == 0 ? fbuf1 : fbuf2, flen[k], enc);
+                    }
+                }
             } else if (errno != EINTR && errno != ENOENT) {
                 break;
             }
@@ -575,7 +571,7 @@ static void supervise(pid_t child, int notify_fd, int out_sock,
     }
 
     if (pidfd >= 0) close(pidfd);
-    free(req); free(resp); free(pbuf); free(jbuf);
+    free(req); free(resp); free(pbuf); free(fbuf1); free(fbuf2);
 }
 
 static void die(const char *msg) {
@@ -764,7 +760,10 @@ int main(int argc, char *argv[]) {
                     char hdr[768];
                     int n = snprintf(hdr, sizeof(hdr),
                         "{\"encodedCommand\":\"%.700s\"}\n", encoded_cmd);
-                    if (n > 0) (void)!write(out, hdr, (size_t)n);
+                    if (n > 0) {
+                        (void)!send(out, hdr, (size_t)n,
+                                    MSG_DONTWAIT | MSG_NOSIGNAL);
+                    }
                 }
                 supervise(child, notify_fd, out, encoded_cmd, host_proc_fd);
                 if (out >= 0) close(out);
