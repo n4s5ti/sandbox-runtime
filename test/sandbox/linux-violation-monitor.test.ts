@@ -62,11 +62,46 @@ d('linux-violation-monitor (listener)', () => {
     expect(violations[0].encodedCommand).toBe('dGVzdA==')
   })
 
-  it('reports relative (dirfd-unresolvable) paths', async () => {
+  it('config disableViolationMonitoring vetoes the monitor', async () => {
+    const { SandboxRuntimeConfigSchema } = await import(
+      '../../src/sandbox/sandbox-config.js'
+    )
+    const parsed = SandboxRuntimeConfigSchema.safeParse({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { allowWrite: [], denyWrite: [], denyRead: [] },
+      disableViolationMonitoring: true,
+    })
+    expect(parsed.success).toBe(true)
+    if (parsed.success) {
+      expect(parsed.data.disableViolationMonitoring).toBe(true)
+    }
+  })
+
+  it('drops unresolved relative paths instead of guessing', async () => {
+    // apply-seccomp resolves relative paths before emitting; a relative
+    // path here means resolution failed. Best-effort telemetry: never
+    // classify what could not be evaluated against policy.
     violations.length = 0
-    await send([JSON.stringify({ nr: 83, syscall: 'mkdir', path: 'rel/dir' })])
+    await send([
+      JSON.stringify({ nr: 83, syscall: 'mkdir', path: 'rel/dir' }),
+      JSON.stringify({ nr: 257, syscall: 'openat', path: '/etc/passwd' }),
+    ])
     await new Promise(r => setTimeout(r, 50))
-    expect(violations.map(v => v.line)).toEqual(['deny mkdir rel/dir'])
+    expect(violations.map(v => v.line)).toEqual(['deny openat /etc/passwd'])
+  })
+
+  it('normalizes ./ and ../ segments before the policy check', async () => {
+    violations.length = 0
+    await send([
+      // inside allow once collapsed → not a violation
+      JSON.stringify({ syscall: 'openat', path: `${allow}/sub/../ok` }),
+      // escapes allow once collapsed → violation, reported as spelled
+      JSON.stringify({ syscall: 'openat', path: `${allow}/../escape` }),
+    ])
+    await new Promise(r => setTimeout(r, 50))
+    expect(violations.map(v => v.line)).toEqual([
+      `deny openat ${allow}/../escape`,
+    ])
   })
 
   it('handles concurrent connections (one per command)', async () => {
@@ -137,6 +172,30 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
     await new Promise(r => setTimeout(r, 100))
     expect(violations).toContain(`deny openat ${deny}/bad`)
     expect(violations.some(v => v.includes(`${allow}/ok`))).toBe(false)
+  })
+
+  it('resolves relative paths against the workload cwd', async () => {
+    violations.length = 0
+    const r = spawnSync(
+      applyPath!,
+      [
+        '/bin/sh',
+        '-c',
+        // Allowed relative write, then a relative write that escapes into
+        // the deny dir — both spelled relative, resolved by the supervisor.
+        `cd ${allow} && echo a > rel-ok.txt && echo b > ../ro/rel-bad.txt`,
+      ],
+      { env: { ...process.env, SRT_OBSERVE_SOCK: mon.observeSocketPath! } },
+    )
+    expect(r.status).toBe(0)
+    await new Promise(r => setTimeout(r, 100))
+    // The allowed relative write resolved inside allow → no violation.
+    expect(violations.some(v => v.includes('rel-ok.txt'))).toBe(false)
+    // The escaping relative write resolved into deny → violation, with
+    // an absolute (cwd-joined) path.
+    const bad = violations.find(v => v.includes('rel-bad.txt'))
+    expect(bad).toBeDefined()
+    expect(bad).toContain(`deny openat ${allow}/../ro/rel-bad.txt`)
   })
 
   it('does not hang when the listener is unreachable', () => {

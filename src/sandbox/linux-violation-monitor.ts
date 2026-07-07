@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { createServer, type Server, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, posix } from 'node:path'
 import { createInterface } from 'node:readline'
 
 import { logForDebugging } from '../utils/debug.js'
@@ -87,13 +87,14 @@ export function startLinuxSandboxViolationMonitor(
     p === prefix || p.startsWith(prefix.endsWith('/') ? prefix : prefix + '/')
 
   /** A write attempt is a violation iff bwrap would refuse it: outside every
-   *  allowWrite prefix, or back inside a denyWrite carve-out. Relative paths
-   *  (dirfd-relative) are reported as-is — we cannot resolve them without the
-   *  tracee's cwd, so err on the side of reporting. */
+   *  allowWrite prefix, or back inside a denyWrite carve-out. apply-seccomp
+   *  resolves relative paths against the tracee's cwd/dirfd before emitting,
+   *  so events arrive absolute; the joined form may still contain ./ and
+   *  ../ segments, which must be collapsed before prefix comparison. */
   const isDenied = (p: string): boolean => {
-    if (!p.startsWith('/')) return true
-    if (denyWritePaths.some(d => underPrefix(p, d))) return true
-    return !allowWritePaths.some(a => underPrefix(p, a))
+    const norm = posix.normalize(p)
+    if (denyWritePaths.some(d => underPrefix(norm, d))) return true
+    return !allowWritePaths.some(a => underPrefix(norm, a))
   }
 
   const shouldIgnore = (path: string, command: string | undefined): boolean => {
@@ -119,6 +120,10 @@ export function startLinuxSandboxViolationMonitor(
       return
     }
     if (typeof ev.path !== 'string') return
+    // Only resolved absolute paths are classifiable. Anything else means
+    // resolution failed upstream (or an old producer): this channel is
+    // best-effort telemetry, so drop rather than guess.
+    if (!ev.path.startsWith('/')) return
     if (!isDenied(ev.path)) return
 
     let command: string | undefined

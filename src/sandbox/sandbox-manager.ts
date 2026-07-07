@@ -397,15 +397,20 @@ async function initialize(
     )
   }
 
-  // Start log monitor for macOS if enabled
-  if (enableLogMonitor && getPlatform() === 'macos') {
+  // Start log monitor if the embedder asked for it and the config does
+  // not veto it (escape hatch: monitoring is best-effort reporting, so a
+  // deployment that hits an unforeseen problem can turn it off without
+  // touching enforcement).
+  const monitoringEnabled =
+    enableLogMonitor && config.disableViolationMonitoring !== true
+  if (monitoringEnabled && getPlatform() === 'macos') {
     logMonitorShutdown = startMacOSSandboxLogMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
       config.ignoreViolations,
     )
     logForDebugging('Started macOS sandbox log monitor')
   }
-  if (enableLogMonitor && getPlatform() === 'linux') {
+  if (monitoringEnabled && getPlatform() === 'linux') {
     linuxMonitor = startLinuxSandboxViolationMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
       {

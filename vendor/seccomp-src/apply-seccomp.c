@@ -38,6 +38,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/prctl.h>
@@ -119,6 +121,9 @@
 #ifndef SECCOMP_FILTER_FLAG_TSYNC_ESRCH
 #  define SECCOMP_FILTER_FLAG_TSYNC_ESRCH (1UL << 4)
 #endif
+#ifndef AT_FDCWD
+#  define AT_FDCWD (-100)
+#endif
 #ifndef SECCOMP_GET_NOTIF_SIZES
 #  define SECCOMP_GET_NOTIF_SIZES 3
 #endif
@@ -144,45 +149,49 @@ struct observe_call {
     int8_t path_arg;
     int8_t path2_arg;
     int8_t flags_arg;
+    /* Argument index of the dirfd governing path_arg/path2_arg, or -1 when
+     * the path is resolved against the caller's cwd (legacy entry points). */
+    int8_t dirfd_arg;
+    int8_t dirfd2_arg;
 };
 
 static const struct observe_call observe_calls[] = {
-    { __NR_openat,     "openat",     1, -1,  2 },
+    { __NR_openat,     "openat",     1, -1,  2,  0, -1 },
 #ifdef __NR_openat2
-    { __NR_openat2,    "openat2",    1, -1, -1 },
+    { __NR_openat2,    "openat2",    1, -1, -1,  0, -1 },
 #endif
-    { __NR_unlinkat,   "unlinkat",   1, -1, -1 },
-    { __NR_mkdirat,    "mkdirat",    1, -1, -1 },
-    { __NR_mknodat,    "mknodat",    1, -1, -1 },
-    { __NR_symlinkat,  "symlinkat",  2, -1, -1 },
-    { __NR_linkat,     "linkat",     1,  3, -1 },
+    { __NR_unlinkat,   "unlinkat",   1, -1, -1,  0, -1 },
+    { __NR_mkdirat,    "mkdirat",    1, -1, -1,  0, -1 },
+    { __NR_mknodat,    "mknodat",    1, -1, -1,  0, -1 },
+    { __NR_symlinkat,  "symlinkat",  2, -1, -1,  1, -1 },
+    { __NR_linkat,     "linkat",     1,  3, -1,  0,  2 },
 #ifdef __NR_renameat
-    { __NR_renameat,   "renameat",   1,  3, -1 },
+    { __NR_renameat,   "renameat",   1,  3, -1,  0,  2 },
 #endif
-    { __NR_renameat2,  "renameat2",  1,  3, -1 },
-    { __NR_fchmodat,   "fchmodat",   1, -1, -1 },
-    { __NR_fchmodat2,  "fchmodat2",  1, -1, -1 },
-    { __NR_fchownat,   "fchownat",   1, -1, -1 },
-    { __NR_utimensat,  "utimensat",  1, -1, -1 },
-    { __NR_connect,    "connect",   -2, -1, -1 },
+    { __NR_renameat2,  "renameat2",  1,  3, -1,  0,  2 },
+    { __NR_fchmodat,   "fchmodat",   1, -1, -1,  0, -1 },
+    { __NR_fchmodat2,  "fchmodat2",  1, -1, -1,  0, -1 },
+    { __NR_fchownat,   "fchownat",   1, -1, -1,  0, -1 },
+    { __NR_utimensat,  "utimensat",  1, -1, -1,  0, -1 },
+    { __NR_connect,    "connect",   -2, -1, -1, -1, -1 },
 #ifdef __x86_64__
     /* Legacy non-*at entry points: glibc/coreutils still call these directly
      * on x86_64. aarch64 only ever had the *at forms. */
-    { __NR_open,       "open",       0, -1,  1 },
-    { __NR_creat,      "creat",      0, -1, -1 },
-    { __NR_unlink,     "unlink",     0, -1, -1 },
-    { __NR_rmdir,      "rmdir",      0, -1, -1 },
-    { __NR_rename,     "rename",     0,  1, -1 },
-    { __NR_link,       "link",       0,  1, -1 },
-    { __NR_symlink,    "symlink",    1, -1, -1 },
-    { __NR_mkdir,      "mkdir",      0, -1, -1 },
-    { __NR_mknod,      "mknod",      0, -1, -1 },
-    { __NR_truncate,   "truncate",   0, -1, -1 },
-    { __NR_chmod,      "chmod",      0, -1, -1 },
-    { __NR_chown,      "chown",      0, -1, -1 },
-    { __NR_lchown,     "lchown",     0, -1, -1 },
-    { __NR_utime,      "utime",      0, -1, -1 },
-    { __NR_utimes,     "utimes",     0, -1, -1 },
+    { __NR_open,       "open",       0, -1,  1, -1, -1 },
+    { __NR_creat,      "creat",      0, -1, -1, -1, -1 },
+    { __NR_unlink,     "unlink",     0, -1, -1, -1, -1 },
+    { __NR_rmdir,      "rmdir",      0, -1, -1, -1, -1 },
+    { __NR_rename,     "rename",     0,  1, -1, -1, -1 },
+    { __NR_link,       "link",       0,  1, -1, -1, -1 },
+    { __NR_symlink,    "symlink",    1, -1, -1, -1, -1 },
+    { __NR_mkdir,      "mkdir",      0, -1, -1, -1, -1 },
+    { __NR_mknod,      "mknod",      0, -1, -1, -1, -1 },
+    { __NR_truncate,   "truncate",   0, -1, -1, -1, -1 },
+    { __NR_chmod,      "chmod",      0, -1, -1, -1, -1 },
+    { __NR_chown,      "chown",      0, -1, -1, -1, -1 },
+    { __NR_lchown,     "lchown",     0, -1, -1, -1, -1 },
+    { __NR_utime,      "utime",      0, -1, -1, -1, -1 },
+    { __NR_utimes,     "utimes",     0, -1, -1, -1, -1 },
 #endif
 };
 static const int n_observe_calls = (int)(sizeof(observe_calls)/sizeof(observe_calls[0]));
@@ -390,6 +399,49 @@ static ssize_t read_remote_cstr(pid_t pid, unsigned long addr, char *dst, size_t
     return nul ? (nul - dst) : r;
 }
 
+/* Resolve a relative path against the tracee's cwd or dirfd via the /proc
+ * magic symlinks. The tracee is frozen inside the trapped syscall, so both
+ * links are stable for single-threaded callers; a racing sibling thread can
+ * at worst mislabel one LOG line (this channel never enforces anything).
+ *
+ * host_proc_fd is an O_PATH handle to /proc opened BEFORE the pid/mount
+ * unshare: the worker later mounts a fresh /proc for the new pid namespace
+ * into the mount namespace this process shares with it, which removes the
+ * host-pid entries from the PATH "/proc" — but the held fd pins the
+ * original superblock, and the notification's pid is a host-namespace pid.
+ *
+ * Returns the joined length, or 0 on ANY failure — the caller then skips
+ * the event entirely (best-effort telemetry: never guess, never block). */
+static size_t resolve_relative(int host_proc_fd, pid_t pid,
+                               const struct seccomp_notif *req,
+                               int dirfd_arg, const char *rel, size_t rellen,
+                               char *dst, size_t dstcap) {
+    if (host_proc_fd < 0) return 0;
+    char link[64];
+    /* The dirfd syscall argument is an int; the kernel exposes the raw
+     * 64-bit register, so AT_FDCWD arrives zero-extended. Truncate. */
+    int dirfd = dirfd_arg >= 0 ? (int)(uint32_t)req->data.args[dirfd_arg]
+                               : AT_FDCWD;
+    int n;
+    if (dirfd == AT_FDCWD) {
+        n = snprintf(link, sizeof(link), "%d/cwd", (int)pid);
+    } else {
+        if (dirfd < 0) return 0;  /* junk fd value */
+        n = snprintf(link, sizeof(link), "%d/fd/%d", (int)pid, dirfd);
+    }
+    if (n <= 0 || (size_t)n >= sizeof(link)) return 0;
+    ssize_t bl = readlinkat(host_proc_fd, link, dst, dstcap - 1);
+    if (bl <= 0) return 0;              /* pid gone, fd closed, EACCES... */
+    if (dst[0] != '/') return 0;        /* memfd:/pipe:/socket: pseudo-name */
+    if ((size_t)bl + 1 + rellen + 1 > dstcap) return 0;  /* would truncate */
+    size_t o = (size_t)bl;
+    dst[o++] = '/';
+    memcpy(dst + o, rel, rellen);
+    o += rellen;
+    dst[o] = '\0';
+    return o;
+}
+
 static void emit_event(int out, const struct observe_call *oc, int nr, pid_t pid,
                        const char *path, size_t pathlen, const char *enc) {
     if (out < 0) return;
@@ -428,7 +480,8 @@ static int connect_observe_sock(const char *path) {
 /* Service the notify fd until the inner-init child exits. Runs in the OUTER
  * STUB, which never installed either seccomp filter. Always replies CONTINUE,
  * even when out_sock < 0, so a missing listener never wedges the workload. */
-static void supervise(pid_t child, int notify_fd, int out_sock, const char *enc) {
+static void supervise(pid_t child, int notify_fd, int out_sock,
+                      const char *enc, int host_proc_fd) {
     struct seccomp_notif_sizes sz;
     if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sz) < 0) {
         sz.seccomp_notif = sizeof(struct seccomp_notif);
@@ -437,7 +490,8 @@ static void supervise(pid_t child, int notify_fd, int out_sock, const char *enc)
     struct seccomp_notif *req = calloc(1, sz.seccomp_notif);
     struct seccomp_notif_resp *resp = calloc(1, sz.seccomp_notif_resp);
     char *pbuf = malloc(OBS_PATH_MAX);
-    if (!req || !resp || !pbuf) return;
+    char *jbuf = malloc(OBS_PATH_MAX * 2);
+    if (!req || !resp || !pbuf || !jbuf) return;
 
     int pidfd = (int)syscall(__NR_pidfd_open, child, 0);
 
@@ -471,14 +525,31 @@ static void supervise(pid_t child, int notify_fd, int out_sock, const char *enc)
                                        su.sun_path, l, enc);
                         }
                     } else if (oc) {
-                        int idxs[2] = { oc->path_arg, oc->path2_arg };
+                        int idxs[2]   = { oc->path_arg,  oc->path2_arg  };
+                        int dirfds[2] = { oc->dirfd_arg, oc->dirfd2_arg };
                         for (int k = 0; k < 2; k++) {
                             if (idxs[k] < 0) continue;
                             ssize_t l = read_remote_cstr(req->pid,
                                           (unsigned long)req->data.args[idxs[k]],
                                           pbuf, OBS_PATH_MAX);
-                            if (l > 0) emit_event(out_sock, oc, req->data.nr,
-                                                  req->pid, pbuf, (size_t)l, enc);
+                            if (l <= 0) continue;
+                            if (pbuf[0] == '/') {
+                                emit_event(out_sock, oc, req->data.nr,
+                                           req->pid, pbuf, (size_t)l, enc);
+                                continue;
+                            }
+                            /* Relative: resolve against the tracee's cwd or
+                             * dirfd. Unresolvable → skip (best effort). */
+                            size_t jl = resolve_relative(host_proc_fd,
+                                          req->pid, req, dirfds[k],
+                                          pbuf, (size_t)l,
+                                          jbuf, OBS_PATH_MAX * 2);
+                            if (jl > 0 &&
+                                ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_ID_VALID,
+                                      &req->id) == 0) {
+                                emit_event(out_sock, oc, req->data.nr,
+                                           req->pid, jbuf, jl, enc);
+                            }
                         }
                     }
                 }
@@ -504,7 +575,7 @@ static void supervise(pid_t child, int notify_fd, int out_sock, const char *enc)
     }
 
     if (pidfd >= 0) close(pidfd);
-    free(req); free(resp); free(pbuf);
+    free(req); free(resp); free(pbuf); free(jbuf);
 }
 
 static void die(const char *msg) {
@@ -631,6 +702,14 @@ int main(int argc, char *argv[]) {
      * succeeds but the new namespace grants no capabilities, so the setgroups
      * write fails. In that case we abort: the caller must supply CAP_SYS_ADMIN.
      */
+    /* Pinned handle to the CURRENT /proc: the worker's fresh /proc mount
+     * for the new pid namespace lands in the mount namespace we are about
+     * to unshare into (fork shares it), hiding host pids from the path
+     * "/proc". Only used when observation is active; harmless otherwise. */
+    int host_proc_fd = observe_sock && *observe_sock
+        ? open("/proc", O_PATH | O_DIRECTORY | O_CLOEXEC)
+        : -1;
+
     if (unshare(CLONE_NEWPID | CLONE_NEWNS) < 0) {
         if (errno != EPERM) {
             die("apply-seccomp: unshare(CLONE_NEWPID|CLONE_NEWNS)");
@@ -687,7 +766,7 @@ int main(int argc, char *argv[]) {
                         "{\"encodedCommand\":\"%.700s\"}\n", encoded_cmd);
                     if (n > 0) (void)!write(out, hdr, (size_t)n);
                 }
-                supervise(child, notify_fd, out, encoded_cmd);
+                supervise(child, notify_fd, out, encoded_cmd, host_proc_fd);
                 if (out >= 0) close(out);
                 close(notify_fd);
             }
